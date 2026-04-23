@@ -141,6 +141,19 @@ const searchStatusEl = document.getElementById('search-status');
 const tocNav = document.getElementById('toc');
 const backlinksContentEl = document.getElementById('backlinks-content');
 
+// ==================== Platform gating ====================
+// Detect the browser build so workspace features can fall back gracefully.
+// The File System Access API supplies folder picking and handle-based I/O on
+// Chromium; Firefox / Safari have no equivalent yet and the adapter surfaces
+// a clear error when Open Folder is clicked there. Only UI whose backing
+// behavior cannot exist on the web at all (OS default-app registration,
+// reveal-in-explorer, auto-updater) is hidden here.
+const IS_WEB = window.formatpad?.platform === 'web';
+if (IS_WEB) {
+  const hideIds = ['btn-set-default', 'ctx-reveal', 'tctx-reveal'];
+  hideIds.forEach((id) => { const el = document.getElementById(id); if (el) el.hidden = true; });
+}
+
 // ==================== State ====================
 let tocScrolling = false;
 let tocScrollHandler = null;
@@ -153,6 +166,11 @@ const tabs = [];
 let activeTabId = null;
 let tabIdCounter = 0;
 let switchingTabs = false;
+
+// Web beforeunload guard — the adapter installs the listener, we supply the predicate.
+if (IS_WEB && typeof window.formatpad.__setDirtyProbe === 'function') {
+  window.formatpad.__setDirtyProbe(() => tabs.some((tb) => tb.isModified));
+}
 
 function getRecoveryKey(tab) {
   return tab.filePath || ('untitled-' + tab.id);
@@ -574,30 +592,56 @@ const editor = new EditorView({
   parent: document.getElementById('editor'),
 });
 
-// Bidirectional scroll sync uses a pair of short one-shot blocks so whichever
+// Bidirectional scroll sync uses a pair of one-shot blocks so whichever
 // direction is actively driving briefly silences the other.
-// - P2E (preview→editor) gets blocked while the editor scrolls the preview.
-//   500ms covers markdown's smooth scrollIntoView (~400ms) plus the trailing
-//   scroll events it emits.
-// - E2P (editor→preview) gets blocked while the preview scrolls the editor.
-//   150ms is enough for EditorView.scrollIntoView — it's instant — and keeps
-//   the forward path responsive to cursor moves that follow a preview scroll.
-const BLOCK_P2E_MS = 500;
+// - P2E (preview→editor) is held until the preview's smooth scroll actually
+//   ends, detected via the `scrollend` event on previewPaneEl. A fixed
+//   timer is unreliable here: smooth scrollIntoView's duration scales with
+//   distance and can exceed 600ms, which used to let the capture-phase
+//   scroll handler teleport the editor mid-animation and produce a visible
+//   "overshoot + return" flicker after a long TOC jump.
+// - E2P (editor→preview) is short: EditorView.scrollIntoView is instant,
+//   so 150ms covers the single resulting scroll event and keeps the
+//   forward path responsive to cursor moves that follow a preview scroll.
 const BLOCK_E2P_MS = 150;
+const BLOCK_P2E_SAFETY_MS = 1500;
 let blockEditorToPreview = false;  // set by preview→editor sync
 let blockPreviewToEditor = false;  // set by editor→preview sync
 let blockE2PTimer = null;
-let blockP2ETimer = null;
+let blockP2ESafetyTimer = null;
+let blockP2EScrollEndHandler = null;
 
 function blockEditorToPreviewBriefly(ms = BLOCK_E2P_MS) {
   blockEditorToPreview = true;
   if (blockE2PTimer) clearTimeout(blockE2PTimer);
   blockE2PTimer = setTimeout(() => { blockEditorToPreview = false; blockE2PTimer = null; }, ms);
 }
-function blockPreviewToEditorBriefly(ms = BLOCK_P2E_MS) {
+
+function blockPreviewToEditorUntilScrollEnd() {
   blockPreviewToEditor = true;
-  if (blockP2ETimer) clearTimeout(blockP2ETimer);
-  blockP2ETimer = setTimeout(() => { blockPreviewToEditor = false; blockP2ETimer = null; }, ms);
+  if (blockP2ESafetyTimer) { clearTimeout(blockP2ESafetyTimer); blockP2ESafetyTimer = null; }
+  if (blockP2EScrollEndHandler) {
+    previewPaneEl.removeEventListener('scrollend', blockP2EScrollEndHandler);
+    blockP2EScrollEndHandler = null;
+  }
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    blockPreviewToEditor = false;
+    if (blockP2ESafetyTimer) { clearTimeout(blockP2ESafetyTimer); blockP2ESafetyTimer = null; }
+    if (blockP2EScrollEndHandler) {
+      previewPaneEl.removeEventListener('scrollend', blockP2EScrollEndHandler);
+      blockP2EScrollEndHandler = null;
+    }
+  };
+  // scrollend can precede a last trailing scroll frame in some engines;
+  // defer one frame so that final event is still filtered.
+  blockP2EScrollEndHandler = () => requestAnimationFrame(release);
+  previewPaneEl.addEventListener('scrollend', blockP2EScrollEndHandler);
+  // Safety: if no scroll actually fires (target already in view, element
+  // not scrollable, page hidden during animation) scrollend never arrives.
+  blockP2ESafetyTimer = setTimeout(release, BLOCK_P2E_SAFETY_MS);
 }
 
 // Sync preview highlight + status bar (called outside of drag)
@@ -608,7 +652,7 @@ function syncPreviewToEditor() {
   const tab = getActiveTab();
   const viewType = tab?.viewType;
   if (!viewType) { updateStatusBar(); return; }
-  blockPreviewToEditorBriefly();
+  blockPreviewToEditorUntilScrollEnd();
   if (viewType === 'markdown') {
     highlightPreviewLine(line);
   } else {
@@ -623,6 +667,7 @@ function syncPreviewToEditor() {
 // line and parks the editor's viewport there.
 function syncEditorToPreview() {
   if (blockPreviewToEditor) return;
+  if (tocScrolling) return; // TOC jump drives the editor directly; suppress intermediate teleport frames during its smooth preview scroll.
   if (switchingTabs) return;
   const tab = getActiveTab();
   if (!tab) return;
@@ -805,7 +850,7 @@ function switchToTab(tabId) {
   // The rAF scroll restore below will fire a preview scroll event. Without
   // this block the capture-phase listener would treat it as user intent and
   // drag the editor to line 0.
-  blockPreviewToEditorBriefly();
+  blockPreviewToEditorUntilScrollEnd();
 
   requestAnimationFrame(() => {
     const scroller = document.querySelector('.cm-scroller');
@@ -826,7 +871,11 @@ function switchToTab(tabId) {
   buildTOC();
   if (sidebarActivePanel === 'backlinks') refreshBacklinks();
 
-  // Auto-detect workspace from file
+  // Auto-detect workspace from file. On desktop, dirPath is the real folder
+  // containing the opened file. On web, single-file opens return dirPath=null
+  // (browser can't attach a directory to a file picked via <input>), so this
+  // block only fires when the user explicitly chose Open Folder — which
+  // workspacePath already reflects.
   if (newTab.dirPath && !workspacePath) {
     workspacePath = newTab.dirPath;
     localStorage.setItem('fp-workspace-path', workspacePath);
