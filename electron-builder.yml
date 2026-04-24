@@ -1,5 +1,20 @@
 appId: com.formatpad.app
 productName: FormatPad
+asar: true
+asarUnpack:
+  - "node_modules/**/*.node"
+compression: maximum
+electronLanguages:
+  - en-US
+  - ko
+  - zh-CN
+  - zh-TW
+  - ja
+  - de
+  - fr
+  - es
+  - pt-BR
+  - ru
 directories:
   output: release
   buildResources: assets
@@ -9,6 +24,16 @@ files:
   - src/locales/**/*
   - dist/**/*
   - package.json
+  - "!node_modules/**/test/**"
+  - "!node_modules/**/tests/**"
+  - "!node_modules/**/*.md"
+  - "!node_modules/**/*.map"
+  - "!node_modules/**/LICENSE*"
+  - "!node_modules/**/CHANGELOG*"
+  - "!node_modules/**/docs/**"
+  - "!node_modules/**/examples/**"
+  - "!node_modules/**/.github/**"
+  - "!node_modules/**/*.ts"
 extraMetadata:
   main: src/main/main.js
 win:
@@ -33,8 +58,10 @@ dmg:
 nsis:
   oneClick: false
   createDesktopShortcut: true
-  perMachine: true
+  perMachine: false
   allowElevation: true
+  allowToChangeInstallationDirectory: true
+  runAfterFinish: true
   multiLanguageInstaller: true
   displayLanguageSelector: true
   installerLanguages:
@@ -43,31 +70,11 @@ nsis:
     - zh_CN
     - zh_TW
     - ja_JP
-    - es_ES
-    - fr_FR
     - de_DE
+    - fr_FR
+    - es_ES
     - pt_BR
     - ru_RU
-    - ar_SA
-    - it_IT
-    - nl_NL
-    - pl_PL
-    - tr_TR
-    - vi_VN
-    - th_TH
-    - sv_SE
-    - da_DK
-    - fi_FI
-    - nb_NO
-    - cs_CZ
-    - el_GR
-    - hu_HU
-    - ro_RO
-    - uk_UA
-    - id_ID
-    - ms_MY
-    - he_IL
-    - hi_IN
   installerIcon: assets/icon.ico
   uninstallerIcon: assets/icon.ico
   installerHeaderIcon: assets/icon.ico

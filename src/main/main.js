@@ -1,4 +1,5 @@
-const { app, BrowserWindow, ipcMain, nativeTheme, dialog, shell } = require('electron');
+try { require("v8-compile-cache"); } catch {}
+const { app, BrowserWindow, ipcMain, nativeTheme, dialog, shell, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs').promises;
@@ -6,6 +7,31 @@ const crypto = require('crypto');
 
 const windows = new Set();
 const watchers = new Map();
+
+// --- Sentry (main process) ---
+// TODO: wire DEFAULT_SENTRY_DSN in the build config once the project's Sentry org is set up.
+if (process.env.SENTRY_DSN) {
+  const Sentry = require('@sentry/electron/main');
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    release: `formatpad@${require('../../package.json').version}`,
+    environment: app.isPackaged ? 'production' : 'development',
+    tracesSampleRate: 0.1,
+    beforeSend(event) {
+      if (event.breadcrumbs?.values) {
+        for (const bc of event.breadcrumbs.values) {
+          if (typeof bc.message === 'string') {
+            bc.message = bc.message.replace(/[^/\\]+\.(?:env|key|pem)\b/gi, '<redacted>');
+          }
+        }
+      }
+      delete event.user;
+      return event;
+    },
+  });
+} else {
+  console.info('[FormatPad] SENTRY_DSN not set — crash reporting disabled');
+}
 
 // --- Locale ---
 const localeData = {
@@ -156,6 +182,7 @@ function createWindow(filePath) {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
     show: false,
     backgroundColor: '#1a1b26',
@@ -224,6 +251,11 @@ async function loadMarkdownFile(win, filePath) {
 }
 
 // --- IPC: system / locale / title ---
+ipcMain.handle('get-app-info', () => ({
+  isPackaged: app.isPackaged,
+  version: app.getVersion(),
+}));
+
 ipcMain.handle('get-system-theme', () => {
   return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
 });
@@ -905,8 +937,17 @@ ipcMain.handle('reveal-in-explorer', async (_event, targetPath) => {
   }
 });
 
-// --- Drag & drop fallback ---
+// Renderer CSP — must match the <meta> tag in index.html.
+const RENDERER_CSP =
+  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+  "img-src 'self' data: blob:; font-src 'self' data:; " +
+  "connect-src 'self' https://api.github.com https://api.githubusercontent.com; " +
+  "worker-src 'self' blob:; frame-src 'none'; object-src 'none'; " +
+  "base-uri 'none'; form-action 'none';";
+
+// --- Navigation + new-window hardening ---
 app.on('web-contents-created', (_event, contents) => {
+  // Block all navigation; only file-drop (file:/// → supported file) is allowed.
   contents.on('will-navigate', (navEvent, url) => {
     navEvent.preventDefault();
     if (url.startsWith('file:///')) {
@@ -917,11 +958,29 @@ app.on('web-contents-created', (_event, contents) => {
       }
     }
   });
+
+  // Block new windows that try to navigate outside the app; open http/https externally.
+  contents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://') || url.startsWith('http://')) {
+      shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
 });
 
 // --- App lifecycle ---
 app.whenReady().then(async () => {
   initLocale();
+
+  // Belt-and-suspenders CSP: set via response header in addition to the <meta> tag.
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [RENDERER_CSP],
+      },
+    });
+  });
 
   // If an installer is currently mid-install, bail out before showing any UI.
   try {

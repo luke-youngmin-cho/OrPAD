@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' file: data: https:; font-src 'self' data:;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://api.github.com https://api.githubusercontent.com https://plausible.io; worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
   <link rel="stylesheet" href="styles/katex.min.css">
   <link rel="stylesheet" href="styles/base.css">
   <title>FormatPad</title>
@@ -173,7 +173,11 @@
       <button id="fmt-json-unescape" title="Unescape JSON String" data-i18n-title="tooltip.json.unescape"><span class="fmt-mono">…</span></button>
       <div class="fmt-sep"></div>
       <button id="fmt-json-repair" title="Repair Broken JSON" data-i18n-title="tooltip.json.repair"><span class="fmt-mono">⚒</span></button>
-      <button id="fmt-json-path" title="JSONPath Query" data-i18n-title="tooltip.json.path"><span class="fmt-mono">$.?</span></button>
+      <div class="fmt-sep"></div>
+      <input type="text" id="fmt-json-path-input" class="fmt-query-input" placeholder="$.store.book[*].author" title="JSONPath Query — Ctrl+Enter to run">
+      <button id="fmt-json-path-run" class="fmt-query-run" title="Run JSONPath"><span class="fmt-mono">▶</span></button>
+      <span id="fmt-json-path-count" class="fmt-query-count"></span>
+      <div class="fmt-sep"></div>
       <button id="fmt-json-schema" title="Validate Against Schema" data-i18n-title="tooltip.json.schema"><span class="fmt-mono">✓sch</span></button>
       <button id="fmt-json-diff" title="Diff Check" data-i18n-title="tooltip.json.diff"><span class="fmt-mono">Δ</span></button>
     </div>
@@ -223,7 +227,9 @@
     <!-- XML only -->
     <div class="fmt-group" data-view="xml" hidden>
       <div class="fmt-sep"></div>
-      <button id="fmt-xml-xpath" title="XPath Query" data-i18n-title="tooltip.xml.xpath"><span class="fmt-mono">/xp/</span></button>
+      <input type="text" id="fmt-xml-xpath-input" class="fmt-query-input" placeholder="//book[@id='1']/title" title="XPath Query — Ctrl+Enter to run">
+      <button id="fmt-xml-xpath-run" class="fmt-query-run" title="Run XPath"><span class="fmt-mono">▶</span></button>
+      <span id="fmt-xml-xpath-count" class="fmt-query-count"></span>
     </div>
 
     <!-- .env -->

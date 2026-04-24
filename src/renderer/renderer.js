@@ -1,3 +1,4 @@
+import { initAnalytics, track, sizeBucket, stackSig } from './analytics.js';
 import { EditorView, basicSetup } from 'codemirror';
 import { EditorState } from '@codemirror/state';
 import { keymap } from '@codemirror/view';
@@ -95,12 +96,37 @@ const wikiLink = {
   },
 };
 
+// ==================== FNV-1a 32-bit hash + LRU cache ====================
+function hash32(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h = Math.imul(h ^ s.charCodeAt(i), 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
+class LRU {
+  constructor(cap) { this.cap = cap; this.m = new Map(); }
+  get(k) {
+    if (!this.m.has(k)) return undefined;
+    const v = this.m.get(k); this.m.delete(k); this.m.set(k, v); return v;
+  }
+  set(k, v) {
+    if (this.m.has(k)) this.m.delete(k);
+    else if (this.m.size >= this.cap) this.m.delete(this.m.keys().next().value);
+    this.m.set(k, v);
+  }
+}
+
 // ==================== Mermaid code block renderer ====================
 let mermaidReady = false;
 let mermaidModule = null;
 const mermaidRenderer = {
   code(text, lang) {
-    if (lang === 'mermaid') return '<div class="mermaid-block" data-mermaid="' + text.replace(/"/g, '&quot;') + '">' + text + '</div>';
+    if (lang === 'mermaid') {
+      const h = hash32(text);
+      return '<div class="mermaid-block" data-mermaid="' + text.replace(/"/g, '&quot;') + '" data-mermaid-hash="' + h + '">' + text + '</div>';
+    }
     return false;
   },
 };
@@ -154,6 +180,28 @@ if (IS_WEB) {
   hideIds.forEach((id) => { const el = document.getElementById(id); if (el) el.hidden = true; });
 }
 
+// ==================== Sentry (renderer) ====================
+// Opt-out check: if localStorage["sentry-opt-out"] is truthy, skip init.
+// TODO: expose "Send crash reports" toggle in the Settings UI once one exists.
+if (!IS_WEB && !localStorage.getItem('sentry-opt-out')) {
+  try {
+    require('@sentry/electron/renderer').init({
+      tracesSampleRate: 0.1,
+      beforeSend(event) {
+        delete event.user;
+        if (event.breadcrumbs?.values) {
+          for (const bc of event.breadcrumbs.values) {
+            if (typeof bc.message === 'string') {
+              bc.message = bc.message.replace(/[^/\\]+\.(?:env|key|pem)\b/gi, '<redacted>');
+            }
+          }
+        }
+        return event;
+      },
+    });
+  } catch {}
+}
+
 // ==================== State ====================
 let tocScrolling = false;
 let tocScrollHandler = null;
@@ -166,6 +214,14 @@ const tabs = [];
 let activeTabId = null;
 let tabIdCounter = 0;
 let switchingTabs = false;
+let tabCountTimer = null;
+function trackTabCountThrottled() {
+  if (tabCountTimer) return;
+  tabCountTimer = setTimeout(() => {
+    track('tab_count', { count: String(tabs.length) });
+    tabCountTimer = null;
+  }, 5000);
+}
 
 // Web beforeunload guard — the adapter installs the listener, we supply the predicate.
 if (IS_WEB && typeof window.formatpad.__setDirtyProbe === 'function') {
@@ -823,9 +879,19 @@ function createTab(filePath, dirPath, content, savedContent) {
     editorState: createEditorState(normContent, viewType),
     scrollTop: { editor: 0, preview: 0 },
     lastAutoSavedContent: null,
+    openedAt: Date.now(),
+    mdCache: new LRU(8),
   };
   tabs.push(tab);
   switchToTab(tab.id);
+  if (filePath) {
+    track('file_open', {
+      format: viewType,
+      size_bucket: sizeBucket(normContent.length),
+      source: IS_WEB ? 'web' : 'local',
+    });
+    trackTabCountThrottled();
+  }
   return tab;
 }
 
@@ -904,8 +970,14 @@ async function closeTab(tabId) {
     window.formatpad.clearRecovery(getRecoveryKey(tab));
   }
 
+  const durationSec = (Date.now() - (tab.openedAt || Date.now())) / 1000;
+  if (tab.filePath && durationSec < 3) {
+    track('file_quick_close', { format: tab.viewType, duration_sec: String(Math.round(durationSec)) });
+  }
+
   const idx = tabs.indexOf(tab);
   tabs.splice(idx, 1);
+  trackTabCountThrottled();
 
   if (tabs.length === 0) {
     activeTabId = null;
@@ -1177,7 +1249,17 @@ function renderPreview(content) {
     return;
   }
 
-  const parsedHtml = marked.parse(content);
+  let parsedHtml;
+  {
+    const mdKey = hash32(content);
+    const mdHit = tab?.mdCache?.get(mdKey);
+    if (mdHit !== undefined) {
+      parsedHtml = mdHit;
+    } else {
+      parsedHtml = marked.parse(content);
+      tab?.mdCache?.set(mdKey, parsedHtml);
+    }
+  }
   contentEl.innerHTML = parsedHtml;
 
   contentEl.querySelectorAll('a[href]').forEach((link) => {
@@ -1259,10 +1341,16 @@ function renderPreview(content) {
 }
 
 function renderHTMLPreview(content) {
+  // Style attributes are permitted: the HTML viewer renders user-authored HTML
+  // where CSS styling is expected. All script/frame/form vectors are blocked below.
+  // on* event attrs are stripped by DOMPurify by default (no need to enumerate).
   const clean = DOMPurify.sanitize(content, {
-    FORBID_TAGS: ['style', 'meta', 'base', 'link'],
-    FORBID_ATTR: ['srcdoc', 'formaction', 'onerror', 'onload', 'onclick'],
+    USE_PROFILES: { html: true },
+    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'input', 'meta', 'link', 'base'],
+    FORBID_ATTR: ['formaction'],
     ADD_ATTR: ['target'],
+    ADD_URI_SAFE_ATTR: [],
+    ALLOWED_URI_REGEXP: /^(?:https?|mailto|tel|data:image\/(?:png|jpeg|gif|webp|svg\+xml))/,
   });
   const csp = "default-src 'none'; img-src data: https: http: file:; style-src 'unsafe-inline'; font-src data:;";
   const wrapped = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + csp + '"><style>body{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;padding:16px;margin:0;color:#222;}</style></head><body>' + clean + '</body></html>';
@@ -1672,10 +1760,11 @@ function renderDelimitedPreview(content, delimiter, label) {
 }
 
 // ==================== XML DOM tree view ====================
-function buildXMLNode(node) {
+function buildXMLNode(node, nodeMap) {
   const wrap = document.createElement('div');
   wrap.className = 'xml-node';
   if (node.nodeType !== 1) return wrap; // only elements
+  if (nodeMap) nodeMap.set(node, wrap);
   const elements = Array.from(node.children);
   const attrs = Array.from(node.attributes || []).map(a =>
     ' <span class="xml-attr-name">' + escapeHtml(a.name) + '</span>=<span class="xml-attr-value">"' + escapeHtml(a.value) + '"</span>'
@@ -1690,7 +1779,7 @@ function buildXMLNode(node) {
     details.appendChild(summary);
     const inner = document.createElement('div');
     inner.className = 'xml-children';
-    for (const child of elements) inner.appendChild(buildXMLNode(child));
+    for (const child of elements) inner.appendChild(buildXMLNode(child, nodeMap));
     details.appendChild(inner);
     wrap.appendChild(details);
   } else {
@@ -1712,10 +1801,13 @@ function renderXMLPreview(content) {
     return;
   }
   contentEl.innerHTML = '';
+  const nodeMap = new WeakMap();
   const wrap = document.createElement('div');
   wrap.className = 'xml-tree';
-  wrap.appendChild(buildXMLNode(doc.documentElement));
+  wrap.appendChild(buildXMLNode(doc.documentElement, nodeMap));
   contentEl.appendChild(wrap);
+  contentEl._xmlDoc = doc;
+  contentEl._xmlNodeMap = nodeMap;
 }
 
 // ==================== .env key-value view ====================
@@ -2840,6 +2932,7 @@ async function saveFile() {
   if (tab.filePath) {
     const ok = await window.formatpad.saveFile(tab.filePath, content);
     if (ok) {
+      const editDuration = Math.round((Date.now() - (tab.openedAt || Date.now())) / 1000);
       tab.lastSavedContent = content;
       tab.isModified = false;
       tab.lastAutoSavedContent = null;
@@ -2847,6 +2940,7 @@ async function saveFile() {
       renderTabBar();
       showSaveFlash();
       window.formatpad.clearRecovery(getRecoveryKey(tab));
+      track('file_save', { format: tab.viewType, edit_duration_sec: String(editDuration) });
     } else {
       alert(t('failedSave'));
     }
@@ -3737,81 +3831,167 @@ document.getElementById('fmt-csv-to-yaml').addEventListener('click', () => {
 document.getElementById('fmt-json-repair').addEventListener('click', () => {
   const text = editor.state.doc.toString();
   if (!text.trim()) return;
+  // If already valid, nothing to repair
   try {
-    const fixed = jsonrepair(text);
-    const pretty = JSON.stringify(JSON.parse(fixed), null, 2);
-    replaceEditorDoc(pretty);
-  } catch (err) { notifyFormatError('Repair', err); }
-});
-document.getElementById('fmt-json-path').addEventListener('click', () => {
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.placeholder = t('modal.jsonpath.placeholder');
-  const result = document.createElement('div');
-  result.className = 'fmt-modal-result';
-  result.textContent = '(enter path and Run)';
-  const container = document.createElement('div');
-  container.style.display = 'flex';
-  container.style.flexDirection = 'column';
-  container.style.gap = '10px';
-  const label = document.createElement('label');
-  label.textContent = 'Path';
-  container.append(label, input, result);
-  const run = () => {
-    try {
-      const data = JSON.parse(editor.state.doc.toString());
-      const matches = JSONPath({ path: input.value, json: data });
-      result.classList.remove('error');
-      result.textContent = Array.isArray(matches) && matches.length
-        ? JSON.stringify(matches, null, 2)
-        : '(no matches)';
-    } catch (err) {
-      result.classList.add('error');
-      result.textContent = err.message || String(err);
-    }
-  };
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); run(); } });
+    JSON.parse(text);
+    notifyFormatError('Repair', new Error('JSON is already valid — nothing to repair'));
+    return;
+  } catch { /* invalid — proceed */ }
+  // Attempt repair
+  let fixed;
+  try {
+    fixed = jsonrepair(text);
+    fixed = JSON.stringify(JSON.parse(fixed), null, 2);
+  } catch (err) { notifyFormatError('Repair', err); return; }
+  // Show diff dialog before applying
+  const taStyle = 'width:100%;height:180px;resize:vertical;font-family:monospace;font-size:11px;' +
+    'background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border-color);' +
+    'border-radius:4px;padding:6px;box-sizing:border-box;';
+  const body = document.createElement('div');
+  body.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:12px;';
+  const leftDiv = document.createElement('div');
+  leftDiv.innerHTML = '<div style="font-size:11px;color:var(--text-secondary);margin-bottom:4px">Original (broken)</div>';
+  const leftTa = document.createElement('textarea');
+  leftTa.readOnly = true; leftTa.value = text; leftTa.style.cssText = taStyle;
+  leftDiv.appendChild(leftTa);
+  const rightDiv = document.createElement('div');
+  rightDiv.innerHTML = '<div style="font-size:11px;color:var(--text-secondary);margin-bottom:4px">Repaired</div>';
+  const rightTa = document.createElement('textarea');
+  rightTa.readOnly = true; rightTa.value = fixed; rightTa.style.cssText = taStyle;
+  rightDiv.appendChild(rightTa);
+  body.appendChild(leftDiv);
+  body.appendChild(rightDiv);
   openFmtModal({
-    title: t('modal.jsonpath.title'),
-    body: container,
+    title: 'JSON Repair',
+    body,
     footer: [
-      { label: t('modal.run'), primary: true, onClick: run },
-      { label: t('modal.copyResult'), onClick: () => navigator.clipboard.writeText(result.textContent).catch(() => {}) },
-      { label: t('modal.close'), onClick: closeFmtModal },
+      { label: 'Apply', primary: true, onClick: () => { replaceEditorDoc(fixed); closeFmtModal(); } },
+      { label: 'Cancel', onClick: closeFmtModal },
     ],
   });
-  setTimeout(() => input.focus(), 30);
 });
+// Inline JSONPath query (format bar)
+{
+  const pathInput = document.getElementById('fmt-json-path-input');
+  const pathRun = document.getElementById('fmt-json-path-run');
+  const pathCount = document.getElementById('fmt-json-path-count');
+
+  function runJsonPath() {
+    const path = pathInput.value.trim();
+    pathInput.classList.remove('fmt-query-error');
+    pathInput.title = '';
+    pathCount.textContent = '';
+    if (currentJsonEditor) currentJsonEditor.clearHighlights();
+    if (!path) return;
+    try {
+      const data = JSON.parse(editor.state.doc.toString());
+      const pointers = JSONPath({ path, json: data, resultType: 'pointer' });
+      const count = Array.isArray(pointers) ? pointers.length : 0;
+      if (count === 0) {
+        notifyFormatError('JSONPath', new Error('0 results'));
+        return;
+      }
+      pathCount.textContent = `(${count} result${count === 1 ? '' : 's'})`;
+      if (currentJsonEditor) currentJsonEditor.highlightPointers(pointers);
+    } catch (err) {
+      pathInput.classList.add('fmt-query-error');
+      pathInput.title = err.message || String(err);
+    }
+  }
+
+  pathRun.addEventListener('click', runJsonPath);
+  pathInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); runJsonPath(); }
+  });
+}
+const ajvSchemaCache = new Map(); // schema JSON string -> { ajv, validate }
 document.getElementById('fmt-json-schema').addEventListener('click', () => {
+  const container = document.createElement('div');
+  container.style.cssText = 'display:flex;flex-direction:column;gap:10px;';
+
+  // URL fetch row
+  const urlRow = document.createElement('div');
+  urlRow.style.cssText = 'display:flex;gap:6px;align-items:center;';
+  const urlInput = document.createElement('input');
+  urlInput.type = 'text';
+  urlInput.placeholder = 'Schema URL — paste and Fetch';
+  urlInput.style.cssText = 'flex:1;';
+  const fetchBtn = document.createElement('button');
+  fetchBtn.textContent = 'Fetch';
+  urlRow.appendChild(urlInput);
+  urlRow.appendChild(fetchBtn);
+
+  const label = document.createElement('label');
+  label.textContent = 'Schema JSON (paste, drop file, or fetch URL above)';
+
   const schemaTa = document.createElement('textarea');
   schemaTa.placeholder = t('modal.schema.placeholder');
   const saved = localStorage.getItem('fp-last-schema');
   if (saved) schemaTa.value = saved;
+
   const result = document.createElement('div');
   result.className = 'fmt-modal-result';
   result.textContent = '(paste schema and Validate)';
-  const container = document.createElement('div');
-  container.style.display = 'flex';
-  container.style.flexDirection = 'column';
-  container.style.gap = '10px';
-  const label = document.createElement('label');
-  label.textContent = 'Schema';
-  container.append(label, schemaTa, result);
+
+  container.append(urlRow, label, schemaTa, result);
+
+  // File drop on textarea
+  schemaTa.addEventListener('dragover', (e) => { e.preventDefault(); });
+  schemaTa.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer?.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { schemaTa.value = reader.result; };
+    reader.readAsText(file);
+  });
+
+  // URL fetch
+  fetchBtn.addEventListener('click', async () => {
+    const url = urlInput.value.trim();
+    if (!url) return;
+    fetchBtn.textContent = '…';
+    fetchBtn.disabled = true;
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      schemaTa.value = await resp.text();
+    } catch (err) {
+      result.classList.remove('ok');
+      result.classList.add('error');
+      result.textContent = 'Fetch error: ' + (err.message || String(err));
+    } finally {
+      fetchBtn.textContent = 'Fetch';
+      fetchBtn.disabled = false;
+    }
+  });
+
   const run = () => {
     try {
-      const schema = JSON.parse(schemaTa.value);
+      const schemaText = schemaTa.value.trim();
+      if (!schemaText) { result.textContent = '(paste schema and Validate)'; return; }
+      const schema = JSON.parse(schemaText);
       const data = JSON.parse(editor.state.doc.toString());
-      localStorage.setItem('fp-last-schema', schemaTa.value);
-      const ajv = new Ajv({ allErrors: true, strict: false });
-      const validate = ajv.compile(schema);
-      if (validate(data)) {
+      localStorage.setItem('fp-last-schema', schemaText);
+      // Per-schema Ajv cache
+      let entry = ajvSchemaCache.get(schemaText);
+      if (!entry) {
+        const ajv = new Ajv({ allErrors: true, strict: false });
+        const validate = ajv.compile(schema);
+        entry = { validate };
+        ajvSchemaCache.set(schemaText, entry);
+      }
+      const valid = entry.validate(data);
+      if (valid) {
         result.classList.remove('error');
         result.classList.add('ok');
         result.textContent = '✓ Valid';
       } else {
         result.classList.remove('ok');
         result.classList.add('error');
-        result.textContent = validate.errors.map(e => `${e.instancePath || '(root)'} ${e.message}`).join('\n');
+        result.textContent = entry.validate.errors
+          .map(e => `${e.instancePath || '(root)'} — ${e.message}`)
+          .join('\n');
       }
     } catch (err) {
       result.classList.remove('ok');
@@ -3966,58 +4146,62 @@ document.getElementById('fmt-html-to-md').addEventListener('click', () => {
 });
 
 // ==================== Extended: XML ====================
-document.getElementById('fmt-xml-xpath').addEventListener('click', () => {
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.placeholder = t('modal.xpath.placeholder');
-  const result = document.createElement('div');
-  result.className = 'fmt-modal-result';
-  result.textContent = '(enter XPath and Run)';
-  const container = document.createElement('div');
-  container.style.display = 'flex';
-  container.style.flexDirection = 'column';
-  container.style.gap = '10px';
-  const label = document.createElement('label');
-  label.textContent = 'XPath';
-  container.append(label, input, result);
-  const run = () => {
+// Inline XPath query (format bar)
+{
+  const xpathInput = document.getElementById('fmt-xml-xpath-input');
+  const xpathRun = document.getElementById('fmt-xml-xpath-run');
+  const xpathCount = document.getElementById('fmt-xml-xpath-count');
+
+  function clearXPathHighlights() {
+    for (const el of contentEl.querySelectorAll('.xml-highlight')) el.classList.remove('xml-highlight');
+  }
+
+  function runXPath() {
+    const query = xpathInput.value.trim();
+    xpathInput.classList.remove('fmt-query-error');
+    xpathInput.title = '';
+    xpathCount.textContent = '';
+    clearXPathHighlights();
+    if (!query) return;
     try {
-      const xmlText = editor.state.doc.toString();
-      const doc = new DOMParser().parseFromString(xmlText, 'application/xml');
-      const perr = doc.querySelector('parsererror');
-      if (perr) throw new Error('Invalid XML');
-      const xres = doc.evaluate(input.value, doc, null, XPathResult.ANY_TYPE, null);
-      const out = [];
+      const doc = contentEl._xmlDoc;
+      if (!doc) { notifyFormatError('XPath', new Error('No XML document loaded')); return; }
+      // Namespace resolver: read prefixes from the root element
+      const resolver = (prefix) => doc.documentElement.lookupNamespaceURI(prefix);
+      const xres = doc.evaluate(query, doc, resolver, XPathResult.ANY_TYPE, null);
+      const nodeMap = contentEl._xmlNodeMap;
       const type = xres.resultType;
-      if (type === XPathResult.NUMBER_TYPE) out.push(String(xres.numberValue));
-      else if (type === XPathResult.STRING_TYPE) out.push(xres.stringValue);
-      else if (type === XPathResult.BOOLEAN_TYPE) out.push(String(xres.booleanValue));
-      else {
-        let node;
-        const serializer = new XMLSerializer();
+      if (type === XPathResult.NUMBER_TYPE) {
+        xpathCount.textContent = '= ' + xres.numberValue;
+      } else if (type === XPathResult.STRING_TYPE) {
+        xpathCount.textContent = '= ' + JSON.stringify(xres.stringValue);
+      } else if (type === XPathResult.BOOLEAN_TYPE) {
+        xpathCount.textContent = '= ' + xres.booleanValue;
+      } else {
+        let node, count = 0, firstEl = null;
         while ((node = xres.iterateNext()) !== null) {
-          out.push(node.nodeType === 1 ? serializer.serializeToString(node) : String(node.nodeValue));
+          count++;
+          const el = nodeMap?.get(node);
+          if (el) { el.classList.add('xml-highlight'); if (!firstEl) firstEl = el; }
+        }
+        if (count === 0) {
+          notifyFormatError('XPath', new Error('0 results'));
+        } else {
+          xpathCount.textContent = `(${count} result${count === 1 ? '' : 's'})`;
+          if (firstEl) firstEl.scrollIntoView({ block: 'nearest' });
         }
       }
-      result.classList.remove('error');
-      result.textContent = out.length ? out.join('\n\n') : '(no matches)';
     } catch (err) {
-      result.classList.add('error');
-      result.textContent = err.message || String(err);
+      xpathInput.classList.add('fmt-query-error');
+      xpathInput.title = err.message || String(err);
     }
-  };
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); run(); } });
-  openFmtModal({
-    title: t('modal.xpath.title'),
-    body: container,
-    footer: [
-      { label: t('modal.run'), primary: true, onClick: run },
-      { label: t('modal.copyResult'), onClick: () => navigator.clipboard.writeText(result.textContent).catch(() => {}) },
-      { label: t('modal.close'), onClick: closeFmtModal },
-    ],
+  }
+
+  xpathRun.addEventListener('click', runXPath);
+  xpathInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); runXPath(); }
   });
-  setTimeout(() => input.focus(), 30);
-});
+}
 
 // ==================== Extended: .env ====================
 document.getElementById('fmt-env-validate').addEventListener('click', () => {
@@ -4096,6 +4280,29 @@ document.getElementById('editor').addEventListener('paste', async (e) => {
 
 // ==================== Mermaid Rendering ====================
 let mmdLastAppliedTheme = null;
+// Per-block debounce timers and SVG cache, keyed by data-mermaid-hash.
+const mermaidTimers = new Map();
+const mermaidSvgCache = new Map();
+
+async function _renderMermaidBlock(block, code, cacheKey) {
+  let valid = true;
+  try { valid = await mermaidModule.parse(code, { suppressErrors: true }); }
+  catch { valid = false; }
+  if (!valid) {
+    block.innerHTML = '<div class="preview-error">Invalid Mermaid diagram.</div>';
+    return;
+  }
+  try {
+    const id = 'mermaid-' + Math.random().toString(36).substring(2, 9);
+    const { svg } = await mermaidModule.render(id, code);
+    if (cacheKey) mermaidSvgCache.set(cacheKey, svg);
+    block.innerHTML = svg;
+    block.classList.add('mermaid-rendered');
+  } catch { block.innerHTML = '<div class="preview-error">Mermaid render failed.</div>'; }
+  // Purge any stray error element Mermaid may have appended to <body>.
+  document.querySelectorAll('body > [id^="dmermaid"], body > svg[id^="mermaid"]').forEach((el) => el.remove());
+}
+
 async function renderMermaidBlocks() {
   const blocks = contentEl.querySelectorAll('.mermaid-block');
   if (blocks.length === 0) return;
@@ -4110,25 +4317,34 @@ async function renderMermaidBlocks() {
     try { mermaidModule.initialize({ startOnLoad: false, theme: mmdTheme, securityLevel: 'strict', logLevel: 'fatal' }); }
     catch {}
     mmdLastAppliedTheme = mmdTheme;
+    mermaidSvgCache.clear();
   }
   for (const block of blocks) {
     const code = block.getAttribute('data-mermaid');
     if (!code) continue;
-    let valid = true;
-    try { valid = await mermaidModule.parse(code, { suppressErrors: true }); }
-    catch { valid = false; }
-    if (!valid) {
-      block.innerHTML = '<div class="preview-error">Invalid Mermaid diagram.</div>';
+    const h = block.getAttribute('data-mermaid-hash');
+
+    // Blocks without a hash (e.g. .mmd file preview) render immediately.
+    if (!h) {
+      await _renderMermaidBlock(block, code, null);
       continue;
     }
-    try {
-      const id = 'mermaid-' + Math.random().toString(36).substring(2, 9);
-      const { svg } = await mermaidModule.render(id, code);
-      block.innerHTML = svg;
+
+    // Cache hit: inject previously rendered SVG without re-invoking mermaid.
+    if (mermaidSvgCache.has(h)) {
+      block.innerHTML = mermaidSvgCache.get(h);
       block.classList.add('mermaid-rendered');
-    } catch { block.innerHTML = '<div class="preview-error">Mermaid render failed.</div>'; }
-    // Purge any stray error element Mermaid may have appended to <body>.
-    document.querySelectorAll('body > [id^="dmermaid"], body > svg[id^="mermaid"]').forEach((el) => el.remove());
+      continue;
+    }
+
+    // 400ms per-block debounce: typing in one block doesn't re-render others.
+    if (mermaidTimers.has(h)) clearTimeout(mermaidTimers.get(h));
+    mermaidTimers.set(h, setTimeout(async () => {
+      mermaidTimers.delete(h);
+      const el = contentEl.querySelector('[data-mermaid-hash="' + h + '"]');
+      if (!el) return;
+      await _renderMermaidBlock(el, el.getAttribute('data-mermaid'), h);
+    }, 400));
   }
 }
 
@@ -4282,7 +4498,54 @@ window.addEventListener('resize', () => {
       window.formatpad.autoSaveRecovery(getRecoveryKey(tab), content);
     }
   }, 30000);
+
+  // Analytics
+  const appInfo = await window.formatpad.getAppInfo();
+  initAnalytics({
+    domain: process.env.PLAUSIBLE_DOMAIN,
+    apiHost: 'https://plausible.io',
+    isPackaged: appInfo.isPackaged,
+    isWeb: IS_WEB,
+  });
+  const firstRun = !localStorage.getItem('fp-first-run');
+  if (firstRun) localStorage.setItem('fp-first-run', '1');
+  track('session_start', {
+    platform: window.formatpad?.platform || 'web',
+    version: appInfo.version || process.env.APP_VERSION,
+    first_run: String(firstRun),
+  });
 })();
+
+// ==================== Analytics event hooks ====================
+const _analyticsSessionStart = Date.now();
+
+window.addEventListener('beforeunload', () => {
+  track('session_end', {
+    duration_min: String(Math.round((Date.now() - _analyticsSessionStart) / 60000)),
+  });
+});
+
+window.addEventListener('error', (e) => {
+  const tab = getActiveTab();
+  track('error', {
+    type: e.error?.name || 'Error',
+    format: tab?.viewType || 'unknown',
+    stack_sig: stackSig(e.error || e),
+  });
+});
+
+document.getElementById('format-bar').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[id]');
+  if (!btn) return;
+  const tab = getActiveTab();
+  track('format_bar_click', {
+    format: tab?.viewType || 'unknown',
+    button_name: btn.id,
+  });
+});
+
+// TODO: Add "Send usage data" toggle to Settings UI (required before P1).
+// Opt-out via: localStorage.setItem("analytics-opt-out", "1") and reload.
 
 // (v2 had a `onSetWorkspaceDir` listener for when the tree editor launched the MD editor as
 // a sub-window. In v3 FormatPad is a standalone process, so this hook is no longer needed.)

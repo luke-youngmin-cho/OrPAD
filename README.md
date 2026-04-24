@@ -155,6 +155,25 @@ opens normally on subsequent launches.
 With admin rights, an alternative is **System Settings → Privacy &
 Security → Open Anyway** once the blocked-app notice appears there.
 
+## Telemetry
+
+FormatPad collects anonymous usage events (session start/end, file open/save,
+format bar interactions, errors) via [Plausible Analytics](https://plausible.io/privacy).
+
+**What we collect:** event names and a small set of non-personal properties
+(file format, rough file size, platform, app version). No file contents,
+filenames, keystrokes, or user identifiers are ever recorded.
+
+**How to opt out:**
+- Run `localStorage.setItem("analytics-opt-out", "1")` in DevTools and reload.
+- On desktop (Electron), development/unpackaged runs are always silent — only
+  production builds send events.
+- A "Send usage data" toggle will be added to the Settings UI before the
+  Phase 1 release.
+
+See [Plausible's privacy policy](https://plausible.io/privacy) for details on
+how aggregated data is processed.
+
 ## Build
 
 ```bash
@@ -188,6 +207,59 @@ npm run build:web:min   # minified bundle for deploy
 - [jsonrepair](https://github.com/josdejong/jsonrepair) — JSON repair
 - [Turndown](https://github.com/mixmark-io/turndown) — HTML → Markdown
 - [esbuild](https://esbuild.github.io/) — Bundler
+
+## Telemetry & crash reports
+
+FormatPad integrates [Sentry](https://sentry.io) for crash reporting so that
+real-world errors can be diagnosed and fixed faster.
+
+### What we collect
+
+When crash reporting is active, Sentry captures:
+- Unhandled exceptions and promise rejections in the main process and renderer.
+- A stack trace and breadcrumb log (recent actions leading up to the crash).
+- App version, OS platform, and Electron/browser version.
+
+**We do not collect** file contents, document paths, clipboard data, keystrokes,
+or any other user-generated content. Sentry's default PII scrubbing is enabled,
+and a `beforeSend` hook additionally strips any breadcrumb message containing
+`.env`, `.key`, or `.pem` fragments before the event leaves the app.
+
+### Opt-out (desktop)
+
+Open DevTools (`Ctrl+Shift+I`) and run:
+
+```js
+localStorage.setItem('sentry-opt-out', '1');
+```
+
+Restart the app. Crash reporting will remain disabled until you remove the key:
+
+```js
+localStorage.removeItem('sentry-opt-out');
+```
+
+> **TODO**: expose a "Send crash reports" checkbox in the Settings UI once one
+> is added (tracked as a follow-up to task P0-4).
+
+### Self-hosted / custom builds
+
+Crash reports are only sent when the `SENTRY_DSN` environment variable is set at
+launch. Official FormatPad releases have a DSN baked in by the release pipeline.
+If you build from source and want your own crash reporting, create a project at
+[sentry.io](https://sentry.io) and launch with:
+
+```bash
+SENTRY_DSN=https://<key>@<org>.ingest.sentry.io/<project> npm start
+```
+
+If `SENTRY_DSN` is unset, the app logs one INFO line and disables all crash
+reporting — no network calls are made.
+
+### Privacy policy
+
+See [Sentry's privacy policy](https://sentry.io/privacy/) for details on how
+captured data is stored and processed.
 
 ## License
 

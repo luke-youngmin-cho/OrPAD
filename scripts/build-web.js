@@ -38,18 +38,22 @@ function copyFile(from, to) {
 function buildIndexHtml(srcHtml) {
   let html = fs.readFileSync(srcHtml, 'utf-8');
 
-  // Tighten CSP for the browser. Drop file: (Electron-only), add blob: for img
-  // (mermaid SVG→PNG conversion loads a Blob URL into an Image element).
+  // Mirror the renderer CSP for the web build. connect-src allows https://* to
+  // support the planned P1-7 URL-open feature (formatpad.io/edit?src=<url>).
   html = html.replace(
     /<meta http-equiv="Content-Security-Policy" content="[^"]+">/,
     '<meta http-equiv="Content-Security-Policy" content="' +
       "default-src 'self'; " +
-      "style-src 'self' 'unsafe-inline'; " +
-      "img-src 'self' data: blob: https:; " +
-      "font-src 'self' data:; " +
       "script-src 'self'; " +
-      "connect-src 'self'; " +
-      "frame-src 'self' data: blob:;" +
+      "style-src 'self' 'unsafe-inline'; " +
+      "img-src 'self' data: blob:; " +
+      "font-src 'self' data:; " +
+      "connect-src 'self' https://*; " +
+      "worker-src 'self' blob:; " +
+      "frame-src 'none'; " +
+      "object-src 'none'; " +
+      "base-uri 'none'; " +
+      "form-action 'none';" +
     '">'
   );
 
@@ -79,7 +83,11 @@ function main() {
     sourcemap: false,
     target: ['chrome120', 'firefox115', 'safari17', 'edge120'],
     loader: { '.css': 'text', '.png': 'dataurl' },
-    define: { 'process.env.NODE_ENV': minify ? '"production"' : '"development"' },
+    define: {
+      'process.env.NODE_ENV': minify ? '"production"' : '"development"',
+      'process.env.PLAUSIBLE_DOMAIN': JSON.stringify(process.env.PLAUSIBLE_DOMAIN || ''),
+      'process.env.APP_VERSION': JSON.stringify(require('../package.json').version),
+    },
   });
 
   // HTML shell

@@ -119,6 +119,58 @@ body { display: flex; flex-direction: column; }
   color: var(--accent-color);
 }
 
+/* ===== Inline query inputs (JSONPath / XPath) ===== */
+.fmt-query-input {
+  height: 22px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-family: monospace;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  width: 150px;
+  outline: none;
+  -webkit-app-region: no-drag;
+  user-select: text;
+}
+.fmt-query-input:focus { border-color: var(--accent-color); }
+.fmt-query-input.fmt-query-error { border-color: var(--syntax-deleted, #f7768e); }
+.fmt-query-run {
+  height: 22px;
+  padding: 0 6px;
+  font-size: 11px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  flex-shrink: 0;
+}
+.fmt-query-run:hover { background: var(--hover-bg); color: var(--text-primary); }
+.fmt-query-count {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  padding: 0 2px;
+}
+
+/* ===== JSON tree highlight ===== */
+.jedit-highlight > .jedit-row {
+  background: var(--active-bg);
+  border-radius: 4px;
+  outline: 1px solid var(--accent-color);
+}
+
+/* ===== XML tree highlight ===== */
+.xml-highlight > .xml-leaf,
+.xml-highlight > details > summary {
+  background: var(--active-bg);
+  border-radius: 4px;
+  outline: 1px solid var(--accent-color);
+}
+
 /* ===== Format Modal ===== */
 #fmt-modal {
   position: fixed;

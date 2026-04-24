@@ -140,7 +140,23 @@ export class JSONEditor {
     return typeof v;
   }
 
-  buildNode({ value, parent, keyOrIndex, depth }) {
+  highlightPointers(pointers) {
+    this.clearHighlights();
+    const set = new Set(pointers);
+    for (const el of this.container.querySelectorAll('[data-jpointer]')) {
+      if (set.has(el.dataset.jpointer)) el.classList.add('jedit-highlight');
+    }
+    const first = this.container.querySelector('.jedit-highlight');
+    if (first) first.scrollIntoView({ block: 'nearest' });
+  }
+
+  clearHighlights() {
+    for (const el of this.container.querySelectorAll('.jedit-highlight')) {
+      el.classList.remove('jedit-highlight');
+    }
+  }
+
+  buildNode({ value, parent, keyOrIndex, depth, pointer = '' }) {
     const type = this.getType(value);
     const row = document.createElement('div');
     row.className = 'jedit-row';
@@ -148,6 +164,7 @@ export class JSONEditor {
 
     const container = document.createElement('div');
     container.className = 'jedit-node';
+    container.dataset.jpointer = pointer;
     container.appendChild(row);
 
     const isRoot = parent === null;
@@ -212,7 +229,8 @@ export class JSONEditor {
 
         for (let i = 0; i < shown; i++) {
           const [k, v] = entries[i];
-          const child = this.buildNode({ value: v, parent: value, keyOrIndex: k, depth: depth + 1 });
+          const token = String(k).replace(/~/g, '~0').replace(/\//g, '~1');
+          const child = this.buildNode({ value: v, parent: value, keyOrIndex: k, depth: depth + 1, pointer: pointer + '/' + token });
           childrenWrap.appendChild(child);
         }
 

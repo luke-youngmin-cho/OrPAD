@@ -129,4 +129,24 @@ if (!failed) {
   console.log('\nPASS: bundle within budget.');
 }
 
+// ── 8. Installer size (Windows .exe) ─────────────────────────────────────────
+const releaseDir = path.join(ROOT, 'release');
+if (fs.existsSync(releaseDir)) {
+  const exeFiles = fs.readdirSync(releaseDir).filter(f => f.endsWith('.exe'));
+  if (exeFiles.length > 0) {
+    for (const f of exeFiles) {
+      const size = fs.statSync(path.join(releaseDir, f)).size;
+      const sizeMb = (size / 1024 / 1024).toFixed(1);
+      const target = 100;
+      const status = parseFloat(sizeMb) <= target ? 'PASS' : 'FAIL';
+      console.log(`Installer: ${sizeMb} MB (target ≤ ${target} MB) — ${status} — ${f}`);
+      if (parseFloat(sizeMb) > target) failed = true;
+    }
+  } else {
+    console.log('Installer: not built yet (run npm run dist:win to measure)');
+  }
+} else {
+  console.log('Installer: not built yet (run npm run dist:win to measure)');
+}
+
 process.exit(failed ? 1 : 0);

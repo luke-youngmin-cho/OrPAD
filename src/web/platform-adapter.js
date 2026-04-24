@@ -682,6 +682,7 @@ const adapter = {
   revealInExplorer() {
     window.alert('"Reveal in File Explorer" is not available in the browser.');
   },
+  getAppInfo() { return Promise.resolve({ isPackaged: true, version: process.env.APP_VERSION || '' }); },
   openDefaultAppsSettings() { /* button is hidden on web */ },
 
   // Auto-updater — desktop-only

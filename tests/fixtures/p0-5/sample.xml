@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<library xmlns="http://example.com/lib" xmlns:meta="http://example.com/meta">
+  <book id="1">
+    <title>JSON Path Guide</title>
+    <author>Alice</author>
+    <meta:isbn>978-0-0001</meta:isbn>
+  </book>
+  <book id="2">
+    <title>XPath Primer</title>
+    <author>Bob</author>
+    <meta:isbn>978-0-0002</meta:isbn>
+  </book>
+</library>

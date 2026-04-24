@@ -17,6 +17,8 @@ esbuild.buildSync({
   loader: { '.css': 'text' },
   define: {
     'process.env.NODE_ENV': '"production"',
+    'process.env.PLAUSIBLE_DOMAIN': JSON.stringify(process.env.PLAUSIBLE_DOMAIN || ''),
+    'process.env.APP_VERSION': JSON.stringify(require('../package.json').version),
   },
 });
 

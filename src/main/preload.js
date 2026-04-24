@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('formatpad', {
   platform: process.platform,
+  getAppInfo: () => ipcRenderer.invoke('get-app-info'),
   // File operations
   onLoadMarkdown: (cb) => ipcRenderer.on('load-markdown', (_e, d) => cb(d)),
   getSystemTheme: () => ipcRenderer.invoke('get-system-theme'),
