@@ -25,6 +25,7 @@ const PACKAGE = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf
 // NOTE: ideal target is 1.8 MB; raised to current+10% until P0-9 tree-shakes mermaid/cytoscape.
 const RENDERER_BUDGET_BYTES = 2.05 * 1024 * 1024; // ~2.05 MB gzipped
 const HTML_BUDGET_BYTES = 100 * 1024;             // 100 KB gzipped
+const WEB_TARGETS = ['chrome90', 'firefox90', 'safari14', 'edge90'];
 
 // ── 1. Bundle the minified renderer in-memory ────────────────────────────────
 console.log('Bundling minified web renderer (in-memory)…');
@@ -35,7 +36,7 @@ const result = await esbuild.build({
   platform: 'browser',
   format: 'iife',
   sourcemap: false,
-  target: ['chrome120', 'firefox115', 'safari17', 'edge120'],
+  target: WEB_TARGETS,
   loader: { '.css': 'text', '.png': 'dataurl' },
   plugins: [{
     name: 'desktop-terminal-stub',

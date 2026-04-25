@@ -281,7 +281,10 @@ function openSharedUrlFromLocation() {
   const hashParams = hashParamsFromLocation();
   const params = hashParams.has('fragment') ? hashParams : searchParams;
   if (!params.toString()) return;
-  queueMicrotask(async () => {
+  const defer = typeof queueMicrotask === 'function'
+    ? queueMicrotask
+    : (callback) => Promise.resolve().then(callback);
+  defer(async () => {
     try {
       if (params.has('fragment')) {
         if (params === searchParams) migrateLegacyFragmentQuery(params);

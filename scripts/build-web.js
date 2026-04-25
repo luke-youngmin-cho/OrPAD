@@ -24,6 +24,7 @@ const fs = require('fs');
 const ROOT = path.join(__dirname, '..');
 const OUT = path.join(ROOT, 'docs');
 const PACKAGE = require('../package.json');
+const WEB_TARGETS = ['chrome90', 'firefox90', 'safari14', 'edge90'];
 // GitHub Pages currently serves this project at /FormatPad/. If the planned
 // formatpad.io root domain becomes primary, switch manifest start_url/scope
 // and file_handlers.action to "/" in src/web/manifest.webmanifest.
@@ -137,7 +138,7 @@ async function main() {
     format: 'iife',
     minify,
     sourcemap: false,
-    target: ['chrome120', 'firefox115', 'safari17', 'edge120'],
+    target: WEB_TARGETS,
     loader: { '.css': 'text', '.png': 'dataurl' },
     plugins: [{
       name: 'desktop-terminal-stub',
