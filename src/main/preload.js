@@ -43,6 +43,11 @@ contextBridge.exposeInMainWorld('formatpad', {
   confirmClose: () => ipcRenderer.send('confirm-close'),
   getLocale: () => ipcRenderer.invoke('get-locale'),
   setLocale: (code) => ipcRenderer.send('set-locale', code),
+  onLocaleChanged: (cb) => {
+    const listener = (_event, payload) => cb(payload);
+    ipcRenderer.on('locale-changed', listener);
+    return () => ipcRenderer.removeListener('locale-changed', listener);
+  },
   autoSaveRecovery: (filePath, content) => ipcRenderer.invoke('auto-save-recovery', filePath, content),
   clearRecovery: (filePath) => ipcRenderer.invoke('clear-recovery', filePath),
   saveImage: (filePath, buffer, ext) => ipcRenderer.invoke('save-image', filePath, buffer, ext),
@@ -125,7 +130,21 @@ contextBridge.exposeInMainWorld('terminal', {
   },
 });
 
+contextBridge.exposeInMainWorld('terminalWindow', {
+  open: (request) => ipcRenderer.invoke('terminal-window-open', request),
+  focus: () => ipcRenderer.invoke('terminal-window-focus'),
+  status: () => ipcRenderer.invoke('terminal-window-status'),
+  dockToMain: () => ipcRenderer.invoke('terminal-window-dock-main'),
+  context: () => ipcRenderer.invoke('terminal-window-context'),
+  onDocked: (cb) => {
+    const listener = (_event, payload) => cb(payload);
+    ipcRenderer.on('terminal-window-docked', listener);
+    return () => ipcRenderer.removeListener('terminal-window-docked', listener);
+  },
+});
+
 contextBridge.exposeInMainWorld('pty', {
+  status: () => ipcRenderer.invoke('terminal.pty.status'),
   shells: () => ipcRenderer.invoke('terminal.pty.shells'),
   restore: () => ipcRenderer.invoke('terminal.pty.restore'),
   spawn: (request) => ipcRenderer.invoke('terminal.pty.spawn', request),

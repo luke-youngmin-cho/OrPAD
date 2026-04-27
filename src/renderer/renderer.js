@@ -214,6 +214,7 @@ statusGitEl.id = 'status-git';
 statusGitEl.className = 'status-git hidden';
 statusGitEl.type = 'button';
 statusZoomEl?.insertAdjacentElement('beforebegin', statusGitEl);
+const btnAiEl = document.getElementById('btn-ai');
 const tabListEl = document.getElementById('tab-list');
 const sidebarEl = document.getElementById('sidebar');
 const fileTreeEl = document.getElementById('file-tree');
@@ -273,6 +274,22 @@ let vimEnabled = localStorage.getItem('editor.vim') === 'true';
 let minimapEnabled = localStorage.getItem('editor.minimap') === 'true';
 let zenChordArmed = false;
 let zenChordTimer = null;
+let aiContextRefreshTimer = null;
+
+function syncAiToolbarButton(visible = aiController?.isVisible?.() === true) {
+  if (!btnAiEl) return;
+  btnAiEl.classList.toggle('active', !!visible);
+  btnAiEl.setAttribute('aria-pressed', String(!!visible));
+  btnAiEl.title = visible ? t('ai.toolbar.hide') : t('ai.toolbar.show');
+}
+
+function scheduleAIContextRefresh(delay = 0) {
+  if (aiContextRefreshTimer) clearTimeout(aiContextRefreshTimer);
+  aiContextRefreshTimer = setTimeout(() => {
+    aiContextRefreshTimer = null;
+    aiController?.refreshActiveContext?.();
+  }, delay);
+}
 
 // Tab state
 const tabs = [];
@@ -1069,6 +1086,7 @@ function createEditorState(content, viewType = 'markdown') {
         }
         if (update.selectionSet && !editorMouseDown) updateStatusBar();
         if (update.docChanged || update.selectionSet) updateVimStatusBar();
+        if (update.docChanged || update.selectionSet) scheduleAIContextRefresh(80);
       }),
       Prec.highest(keymap.of(editorUxKeymap)),
       keymap.of([
@@ -1456,6 +1474,7 @@ function switchToTab(tabId) {
   // keep the previous markdown's TOC/backlinks pinned.
   buildTOC();
   if (sidebarActivePanel === 'backlinks') refreshBacklinks();
+  aiController?.refreshActiveContext?.({ force: true });
 
   // RB-1: opening one file grants that file only. Workspace authority comes
   // from the main process after Open Folder or trusted restore.
@@ -1506,6 +1525,7 @@ async function closeTab(tabId) {
     document.body.classList.remove('json-diff-mode');
     updateTitle();
     renderTabBar();
+    aiController?.refreshActiveContext?.({ force: true });
     return;
   }
 
@@ -3074,13 +3094,35 @@ function updateGitStatusBar() {
   let label = `Git: ${gitRepoState.branch}`;
   if (Number.isInteger(gitRepoState.ahead) && Number.isInteger(gitRepoState.behind)) {
     const parts = [];
-    if (gitRepoState.ahead > 0) parts.push(`↑${gitRepoState.ahead}`);
-    if (gitRepoState.behind > 0) parts.push(`↓${gitRepoState.behind}`);
+    if (gitRepoState.ahead > 0) parts.push(`${gitRepoState.ahead} ahead`);
+    if (gitRepoState.behind > 0) parts.push(`${gitRepoState.behind} behind`);
     if (parts.length) label += ` ${parts.join(' ')}`;
   }
   statusGitEl.textContent = label;
   statusGitEl.title = 'Open Git commands';
   statusGitEl.classList.remove('hidden');
+}
+
+function gitStatusCounts() {
+  const counts = { modified: 0, added: 0, deleted: 0, untracked: 0, other: 0 };
+  for (const badge of gitRepoState.statuses?.values?.() || []) {
+    if (badge === 'M') counts.modified += 1;
+    else if (badge === 'A') counts.added += 1;
+    else if (badge === 'D') counts.deleted += 1;
+    else if (badge === 'U' || badge === '?') counts.untracked += 1;
+    else counts.other += 1;
+  }
+  return counts;
+}
+
+function formatGitCounts(counts) {
+  const parts = [];
+  if (counts.modified) parts.push(`${counts.modified} modified`);
+  if (counts.added) parts.push(`${counts.added} added`);
+  if (counts.deleted) parts.push(`${counts.deleted} deleted`);
+  if (counts.untracked) parts.push(`${counts.untracked} untracked`);
+  if (counts.other) parts.push(`${counts.other} other`);
+  return parts.join(', ') || 'No working tree changes detected';
 }
 
 function showGitSlowBanner() {
@@ -3354,6 +3396,98 @@ async function checkoutGitBranchSafely(branch) {
   scheduleGitRefresh(0);
 }
 
+function appendGitPanelButton(actions, label, enabled, handler, primary = false) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  button.disabled = !enabled;
+  if (primary) button.className = 'primary';
+  button.addEventListener('click', async () => {
+    try {
+      await handler();
+    } catch (err) {
+      notifyFormatError('Git', err);
+    }
+  });
+  actions.appendChild(button);
+  return button;
+}
+
+function openGitPanel() {
+  const body = document.createElement('div');
+  body.className = 'git-command-panel';
+  const summary = document.createElement('div');
+  summary.className = 'git-command-summary';
+  const actions = document.createElement('div');
+  actions.className = 'git-command-actions';
+
+  if (!workspacePath) {
+    summary.innerHTML = `
+      <strong>No workspace is open.</strong>
+      <span>Open a folder first to enable Git status, branch switching, diff, and revert commands.</span>
+    `;
+    appendGitPanelButton(actions, 'Open Folder...', true, async () => {
+      closeFmtModal();
+      await openFolder();
+    }, true);
+  } else if (!gitRepoState.isRepo) {
+    summary.innerHTML = `
+      <strong>No Git repository detected.</strong>
+      <span>${escapeHtml(workspacePath)}</span>
+      <span>FormatPad scans the opened workspace root for Git status.</span>
+    `;
+    appendGitPanelButton(actions, 'Refresh Status', true, async () => {
+      await refreshGitStatus();
+      closeFmtModal();
+      openGitPanel();
+    }, true);
+    appendGitPanelButton(actions, 'Open Command Palette: Git', true, () => {
+      closeFmtModal();
+      commandPalette?.open('Git: ');
+    });
+  } else {
+    const counts = gitStatusCounts();
+    const activeTab = getActiveTab();
+    const activeFileInWorkspace = !!activeTab?.filePath && isPathInsideWorkspace(activeTab.filePath);
+    summary.innerHTML = `
+      <strong>Git repository active</strong>
+      <span>Branch: ${escapeHtml(gitRepoState.branch || 'unknown')}</span>
+      <span>Changes: ${escapeHtml(formatGitCounts(counts))}</span>
+      ${Number.isInteger(gitRepoState.ahead) && Number.isInteger(gitRepoState.behind)
+        ? `<span>Remote: ${gitRepoState.ahead} ahead, ${gitRepoState.behind} behind</span>`
+        : ''}
+    `;
+    appendGitPanelButton(actions, 'Refresh Status', true, async () => {
+      await refreshGitStatus();
+      closeFmtModal();
+      openGitPanel();
+    });
+    appendGitPanelButton(actions, 'Branch Switcher...', true, async () => {
+      closeFmtModal();
+      await openGitBranchSwitcher();
+    }, true);
+    appendGitPanelButton(actions, 'Show Active File Diff', activeFileInWorkspace, async () => {
+      closeFmtModal();
+      await showGitDiffForActiveFile();
+    });
+    appendGitPanelButton(actions, 'Revert Active File', activeFileInWorkspace, async () => {
+      closeFmtModal();
+      await revertGitCurrentFile();
+    });
+    appendGitPanelButton(actions, 'Command Palette: Git', true, () => {
+      closeFmtModal();
+      commandPalette?.open('Git: ');
+    });
+  }
+
+  body.append(summary, actions);
+  openFmtModal({
+    title: 'Git Status and Commands',
+    body,
+    footer: [{ label: 'Close', primary: true, onClick: closeFmtModal }],
+  });
+}
+
 async function openGitBranchSwitcher() {
   if (!workspacePath) return;
   const branches = await gitListBranches(workspacePath);
@@ -3381,7 +3515,7 @@ async function openGitBranchSwitcher() {
   });
 }
 
-statusGitEl?.addEventListener('click', () => commandPalette?.open('Git: '));
+statusGitEl?.addEventListener('click', openGitPanel);
 document.getElementById('editor')?.addEventListener('formatpad-git-revert-hunk', (event) => {
   revertGitHunk(event.detail?.hunk).catch(err => notifyFormatError('Git', err));
 });
@@ -4102,13 +4236,7 @@ function collectLanguageCommands() {
     keywords: [code],
     run: () => {
       langSelect.value = code;
-      localStorage.setItem('fp-locale', code);
-      setLocale(code);
-      window.formatpad.setLocale(code);
-      applyLocaleToDOM();
-      updateTitle();
-      if (getActiveTab()) renderPreview(editor.state.doc.toString());
-      renderThemePanel();
+      changeAppLocale(code);
     },
   }));
 }
@@ -4123,6 +4251,7 @@ function setupCommandRegistry() {
     { id: 'file.saveAs', title: 'Save As', category: 'File', keybinding: 'Ctrl Shift S', enabled: ({ hasActiveTab }) => hasActiveTab, run: saveFileAs },
     { id: 'file.closeTab', title: 'Close Tab', category: 'File', keybinding: 'Ctrl W', enabled: ({ hasActiveTab }) => hasActiveTab, run: () => activeTabId && closeTab(activeTabId) },
     { id: 'file.closeAll', title: 'Close All Tabs', category: 'File', enabled: () => tabs.length > 0, run: closeAllUnpinnedTabs },
+    { id: 'git.openPanel', title: 'Open Git Status and Commands', category: 'Git', run: openGitPanel },
     { id: 'git.refresh', title: 'Refresh Status', category: 'Git', enabled: () => !!workspacePath, run: () => refreshGitStatus() },
     { id: 'git.branchSwitcher', title: 'Open Branch Switcher', category: 'Git', enabled: () => gitRepoState.isRepo, run: openGitBranchSwitcher },
     { id: 'git.showDiff', title: 'Show diff (vs HEAD)', category: 'Git', enabled: ({ activeTab }) => gitRepoState.isRepo && !!activeTab?.filePath, run: showGitDiffForActiveFile },
@@ -4158,9 +4287,12 @@ function setupCommandRegistry() {
     { id: 'view.split', title: 'Split View', category: 'View', run: () => setViewMode('split') },
     { id: 'view.preview', title: 'Preview Only', category: 'View', run: () => setViewMode('preview') },
     { id: 'view.themePanel', title: 'Open Theme Panel', category: 'View', run: openThemePanel },
+    { id: 'ai.openChat', title: 'Open AI Chat', category: 'AI', run: () => aiController?.openChat?.() },
     { id: 'ai.newChat', title: 'New AI Chat', category: 'AI', run: () => aiController?.newChat?.() },
+    { id: 'ai.openActions', title: 'Open AI Assist Tools', category: 'AI', run: () => aiController?.openActions?.() },
     { id: 'ai.switchProvider', title: 'Switch AI Provider', category: 'AI', run: () => aiController?.openSettings?.() },
-    { id: 'ai.runLastAction', title: 'Run Last AI Action', category: 'AI', run: () => aiController?.runLastAction?.() },
+    { id: 'ai.runLastAction', title: 'Run Suggested AI Assist Tool', category: 'AI', run: () => aiController?.runLastAction?.() },
+    { id: 'mcp.openServers', title: 'Open MCP Servers', category: 'MCP', run: () => aiController?.openMcp?.() },
     { id: 'terminal.newTerminal', title: 'New Terminal', category: 'Terminal', keybinding: 'Ctrl Shift `', run: () => terminalController?.newTerminal?.() },
     { id: 'terminal.commandRunner', title: 'Run Command in Command Runner', category: 'Terminal', run: () => terminalController?.openRunner?.() },
     { id: 'settings.open', title: 'Open Settings', category: 'Settings', run: openSettingsModal },
@@ -4347,14 +4479,36 @@ LANGUAGES.forEach(({ code, name }) => {
   opt.textContent = name;
   langSelect.appendChild(opt);
 });
-langSelect.addEventListener('change', () => {
-  localStorage.setItem('fp-locale', langSelect.value);
-  setLocale(langSelect.value);
-  window.formatpad.setLocale(langSelect.value);
+
+function refreshLocalizedSurfaces() {
   applyLocaleToDOM();
   updateTitle();
   if (getActiveTab()) renderPreview(editor.state.doc.toString());
   renderThemePanel();
+  terminalController?.refreshLocale?.();
+  aiController?.refreshLocale?.();
+  syncAiToolbarButton();
+}
+
+function changeAppLocale(code, { persist = true, broadcast = true } = {}) {
+  if (!code) return;
+  if (persist) localStorage.setItem('fp-locale', code);
+  setLocale(code);
+  if (langSelect.value !== getLocaleCode()) langSelect.value = getLocaleCode();
+  if (broadcast) window.formatpad.setLocale(getLocaleCode());
+  refreshLocalizedSurfaces();
+}
+
+langSelect.addEventListener('change', () => {
+  changeAppLocale(langSelect.value);
+});
+
+window.formatpad.onLocaleChanged?.(({ code } = {}) => {
+  if (!code || code === getLocaleCode()) {
+    refreshLocalizedSurfaces();
+    return;
+  }
+  changeAppLocale(code, { persist: false, broadcast: false });
 });
 
 // ==================== Drag & Drop ====================
@@ -4938,8 +5092,15 @@ const fmtModalEl = document.getElementById('fmt-modal');
 const fmtModalTitleEl = document.getElementById('fmt-modal-title');
 const fmtModalBodyEl = document.getElementById('fmt-modal-body');
 const fmtModalFooterEl = document.getElementById('fmt-modal-footer');
+let fmtModalOnClose = null;
 
-function openFmtModal({ title, body, footer }) {
+function openFmtModal({ title, body, footer, onClose }) {
+  if (!fmtModalEl.classList.contains('hidden')) {
+    const previousOnClose = fmtModalOnClose;
+    fmtModalOnClose = null;
+    previousOnClose?.();
+  }
+  fmtModalOnClose = typeof onClose === 'function' ? onClose : null;
   fmtModalTitleEl.textContent = title;
   fmtModalBodyEl.innerHTML = '';
   if (typeof body === 'string') fmtModalBodyEl.innerHTML = body;
@@ -4956,7 +5117,11 @@ function openFmtModal({ title, body, footer }) {
 }
 function closeFmtModal() {
   if (fmtModalEl.classList.contains('locked')) return;
+  if (fmtModalEl.classList.contains('hidden')) return;
   fmtModalEl.classList.add('hidden');
+  const onClose = fmtModalOnClose;
+  fmtModalOnClose = null;
+  onClose?.();
 }
 document.getElementById('fmt-modal-close').addEventListener('click', closeFmtModal);
 document.getElementById('fmt-modal-backdrop').addEventListener('click', closeFmtModal);
@@ -4970,6 +5135,13 @@ document.addEventListener('keydown', (e) => {
 
 function confirmUrlFetchModal(detail) {
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      closeFmtModal();
+      resolve(ok);
+    };
     const body = document.createElement('div');
     body.className = 'share-modal';
     const title = detail.kind === 'large' ? 'Large URL import' : 'External URL import';
@@ -4984,9 +5156,10 @@ function confirmUrlFetchModal(detail) {
     openFmtModal({
       title,
       body,
+      onClose: () => finish(false),
       footer: [
-        { label: 'Cancel', onClick: () => { closeFmtModal(); resolve(false); } },
-        { label: 'Fetch file', primary: true, onClick: () => { closeFmtModal(); resolve(true); } },
+        { label: 'Cancel', onClick: () => finish(false) },
+        { label: 'Fetch file', primary: true, onClick: () => finish(true) },
       ],
     });
   });
@@ -6107,6 +6280,11 @@ window.addEventListener('resize', () => {
         }));
       },
       getWorkspacePath() { return workspacePath; },
+      activateTab(tabId) {
+        if (!tabs.some(tab => tab.id === tabId)) return false;
+        switchToTab(tabId);
+        return true;
+      },
       getRunnerAttachment() { return terminalController?.getLastOutput?.() || null; },
       getTemplateSection(section) {
         const active = getActiveTab();
@@ -6151,8 +6329,11 @@ window.addEventListener('resize', () => {
       openModal: openFmtModal,
       closeModal: closeFmtModal,
       notify: notifyFormatError,
+      onVisibilityChange: syncAiToolbarButton,
     },
   });
+  btnAiEl?.addEventListener('click', () => aiController?.toggle?.());
+  syncAiToolbarButton();
 
   const commandRoot = document.getElementById('command-palette-root') || document.body;
   commandPalette = createCommandPalette({

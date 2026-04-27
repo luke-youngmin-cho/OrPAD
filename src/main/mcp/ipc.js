@@ -38,6 +38,21 @@ function redactedConfig(config) {
   };
 }
 
+async function listServersWithRuntimeEnabledState(registry, clients) {
+  const servers = await registry.listServers();
+  let changed = false;
+  const normalized = servers.map(server => {
+    const status = clients.statusFor(server.id);
+    const isRuntimeEnabled = status.state === 'running' || status.state === 'connecting';
+    if (server.enabled && !isRuntimeEnabled) {
+      changed = true;
+      return { ...server, enabled: false };
+    }
+    return server;
+  });
+  return changed ? registry.saveServers(normalized) : servers;
+}
+
 function shortJson(value, max = 4000) {
   const text = JSON.stringify(value || {}, null, 2);
   return text.length > max ? `${text.slice(0, max)}\n...` : text;
@@ -73,9 +88,16 @@ async function promptForToolPermission(event, registry, permissions, serverId, t
     : await dialog.showMessageBox(options);
 
   const scope = scopes[result.response] || null;
-  if (!scope) throw new Error('MCP tool call canceled.');
+  if (!scope) return { scope: 'canceled', canceled: true };
   if (scope !== 'once') await permissions.grant(serverId, toolName, scope);
   return { scope };
+}
+
+function canceledToolResult() {
+  return {
+    canceled: true,
+    content: [{ type: 'text', text: 'MCP tool call canceled.' }],
+  };
 }
 
 function registerMcpHandlers({ ipcMain, app, authority }) {
@@ -84,7 +106,7 @@ function registerMcpHandlers({ ipcMain, app, authority }) {
   const clients = new McpClientPool({ registry });
 
   ipcMain.handle('mcp-list-servers', async () => {
-    const servers = await registry.listServers();
+    const servers = await listServersWithRuntimeEnabledState(registry, clients);
     return {
       servers: servers.map(publicServer),
       statuses: clients.statusesFor(servers),
@@ -103,14 +125,29 @@ function registerMcpHandlers({ ipcMain, app, authority }) {
   });
 
   ipcMain.handle('mcp-set-enabled', async (event, id, enabled) => {
-    const server = await registry.setEnabled(String(id || ''), enabled === true);
-    if (server.enabled) {
+    const serverId = String(id || '');
+    if (enabled === true) {
+      const server = await registry.getServer(serverId);
+      if (!server) throw new Error(`Unknown MCP server: ${serverId}`);
       const workspaceRoot = authority?.getWorkspaceRoot(event.sender) || '';
       if (!workspaceRoot) throw new Error('Open a workspace before enabling MCP servers.');
-      await clients.enable(server, workspaceRoot);
-    } else {
-      await clients.disable(server.id);
+      try {
+        await clients.enable(server, workspaceRoot);
+        const saved = await registry.setEnabled(serverId, true);
+        const servers = await registry.listServers();
+        return {
+          server: publicServer(saved),
+          statuses: clients.statusesFor(servers),
+        };
+      } catch (err) {
+        await clients.disable(serverId).catch(() => {});
+        await registry.setEnabled(serverId, false).catch(() => {});
+        throw err;
+      }
     }
+
+    const server = await registry.setEnabled(serverId, false);
+    await clients.disable(server.id);
     const servers = await registry.listServers();
     return {
       server: publicServer(server),
@@ -156,7 +193,8 @@ function registerMcpHandlers({ ipcMain, app, authority }) {
 
     const alreadyAllowed = await permissions.hasPermission(sid, name);
     if (!alreadyAllowed) {
-      await promptForToolPermission(event, registry, permissions, sid, name, normalizedArgs);
+      const permission = await promptForToolPermission(event, registry, permissions, sid, name, normalizedArgs);
+      if (permission?.canceled) return canceledToolResult();
     }
 
     return clients.callTool(sid, name, normalizedArgs);

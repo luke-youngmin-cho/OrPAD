@@ -3,6 +3,7 @@ import { extractApplicableCodeBlocks, openApplyDiff } from './apply-diff.js';
 import { estimateCostUsd, getProvider, providers } from './providers/index.js';
 import { getAction, getActionsFor } from './actions/index.js';
 import { createMcpController } from './mcp-ui/index.js';
+import { t } from '../i18n.js';
 
 const LS = {
   visible: 'fp-ai-sidebar-visible',
@@ -19,8 +20,73 @@ function el(tag, className, text) {
   return node;
 }
 
+function fmt(key, vars = {}) {
+  let text = t(key);
+  for (const [name, value] of Object.entries(vars)) {
+    text = text.split(`{${name}}`).join(String(value));
+  }
+  return text;
+}
+
 function nowIso() {
   return new Date().toISOString();
+}
+
+function makeAbortError(message = 'AI request canceled.', name = 'AbortError') {
+  try {
+    return new DOMException(message, name);
+  } catch {
+    const err = new Error(message);
+    err.name = name;
+    return err;
+  }
+}
+
+function isAbortError(err) {
+  return err?.name === 'AbortError' || err?.name === 'TimeoutError';
+}
+
+function isCancelError(err) {
+  return err?.name === 'AbortError';
+}
+
+function throwIfSignalAborted(signal) {
+  if (!signal?.aborted) return;
+  throw signal.reason || makeAbortError();
+}
+
+function abortController(controller, reason) {
+  try {
+    controller.abort(reason);
+  } catch {
+    controller.abort();
+  }
+}
+
+function linkAbortSignals(signals) {
+  const controller = new AbortController();
+  const cleanups = [];
+  const abortFrom = (signal) => {
+    if (controller.signal.aborted) return;
+    abortController(controller, signal?.reason || makeAbortError());
+  };
+
+  for (const signal of signals.filter(Boolean)) {
+    if (signal.aborted) {
+      abortFrom(signal);
+      break;
+    }
+    const listener = () => abortFrom(signal);
+    signal.addEventListener('abort', listener, { once: true });
+    cleanups.push(() => signal.removeEventListener('abort', listener));
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      for (const cleanup of cleanups) cleanup();
+    },
+  };
 }
 
 function fileName(path) {
@@ -70,7 +136,10 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
   let activeMode = 'chat';
   let sending = false;
   let historyQuery = '';
+  let historyLoadSeq = 0;
+  let chatAbortController = null;
   let actionRunning = null;
+  let actionRunSeq = 0;
   let actionStatus = '';
   let runnerAttachment = null;
   let includeRunnerOutput = false;
@@ -80,19 +149,18 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
   root.innerHTML = `
     <div class="ai-header">
       <button type="button" class="ai-provider-button"></button>
-      <button type="button" class="ai-close" title="Close AI sidebar">x</button>
     </div>
     <div class="ai-mode-tabs">
-      <button type="button" data-mode="chat" class="active">Chat</button>
-      <button type="button" data-mode="actions">Actions</button>
-      <button type="button" data-mode="mcp">MCP</button>
+      <button type="button" data-mode="chat" class="active">${t('ai.tab.chat')}</button>
+      <button type="button" data-mode="actions">${t('ai.tab.assist')}</button>
+      <button type="button" data-mode="mcp">${t('ai.tab.mcp')}</button>
     </div>
     <div class="ai-main">
       <section class="ai-history">
         <div class="ai-history-head">
-          <button type="button" class="ai-new-chat">New</button>
-          <button type="button" class="ai-rename-chat">Rename</button>
-          <input type="search" placeholder="Search">
+          <button type="button" class="ai-new-chat">${t('ai.history.new')}</button>
+          <button type="button" class="ai-rename-chat">${t('ai.history.rename')}</button>
+          <input type="search" placeholder="${t('ai.history.searchPlaceholder')}">
         </div>
         <div class="ai-history-list"></div>
       </section>
@@ -103,7 +171,6 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
   `;
 
   const providerBtn = root.querySelector('.ai-provider-button');
-  const closeBtn = root.querySelector('.ai-close');
   const chatPanel = root.querySelector('.ai-chat-panel');
   const actionsPanel = root.querySelector('.ai-actions-panel');
   const mcpPanel = root.querySelector('.ai-mcp-panel');
@@ -113,20 +180,21 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
   const renameChatBtn = root.querySelector('.ai-rename-chat');
 
   const logEl = el('div', 'ai-log');
+  const activeContextEl = el('div', 'ai-context-chip');
   const optionsEl = el('div', 'ai-context-options');
   const composerWrap = el('div', 'ai-composer-wrap');
   const composer = document.createElement('textarea');
   composer.className = 'ai-composer';
   composer.rows = 4;
-  composer.placeholder = 'Ask about this tab, or use /model, /clear, /copy, /file <path>';
+  composer.placeholder = t('ai.composer.placeholder');
   const footer = el('div', 'ai-footer');
-  const sendBtn = el('button', 'ai-send', 'Send');
+  const sendBtn = el('button', 'ai-send', t('ai.send'));
   sendBtn.type = 'button';
   composerWrap.append(composer, footer, sendBtn);
-  chatPanel.append(optionsEl, logEl, composerWrap);
+  chatPanel.append(activeContextEl, optionsEl, logEl, composerWrap);
 
   const includeTabsLabel = document.createElement('label');
-  includeTabsLabel.innerHTML = '<input type="checkbox"> Include open tab list';
+  includeTabsLabel.innerHTML = `<input type="checkbox"> ${t('ai.option.includeTabs')}`;
   includeTabsLabel.querySelector('input').checked = includeTabs;
   includeTabsLabel.querySelector('input').addEventListener('change', (event) => {
     includeTabs = event.target.checked;
@@ -135,7 +203,7 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
   });
 
   const includeTreeLabel = document.createElement('label');
-  includeTreeLabel.innerHTML = '<input type="checkbox"> Include workspace files';
+  includeTreeLabel.innerHTML = `<input type="checkbox"> ${t('ai.option.includeTree')}`;
   includeTreeLabel.querySelector('input').checked = includeTree;
   includeTreeLabel.querySelector('input').addEventListener('change', (event) => {
     includeTree = event.target.checked;
@@ -153,16 +221,16 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     pre.textContent = runnerAttachment.output || '';
     body.appendChild(pre);
     hooks.openModal?.({
-      title: 'Runner output attachment',
+      title: t('ai.runner.attachmentTitle'),
       body,
       footer: [
-        { label: includeRunnerOutput ? 'Exclude from next chat' : 'Include in next chat', onClick: () => {
+        { label: includeRunnerOutput ? t('ai.runner.exclude') : t('ai.runner.include'), onClick: () => {
           includeRunnerOutput = !includeRunnerOutput;
           renderRunnerChip();
           updateFooter();
           hooks.closeModal?.();
         } },
-        { label: 'Close', primary: true, onClick: () => hooks.closeModal?.() },
+        { label: t('modal.close'), primary: true, onClick: () => hooks.closeModal?.() },
       ],
     });
   });
@@ -174,9 +242,40 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     track,
   });
 
+  function setCheckboxLabel(label, text) {
+    const input = label.querySelector('input');
+    label.textContent = '';
+    if (input) label.append(input, ` ${text}`);
+  }
+
   function renderHeader() {
     providerBtn.textContent = `${provider.displayName} / ${model || 'model'}`;
-    providerBtn.title = 'AI provider settings';
+    providerBtn.title = t('ai.provider.settingsTitle');
+  }
+
+  function refreshLocale() {
+    root.querySelector('[data-mode="chat"]').textContent = t('ai.tab.chat');
+    root.querySelector('[data-mode="actions"]').textContent = t('ai.tab.assist');
+    root.querySelector('[data-mode="mcp"]').textContent = t('ai.tab.mcp');
+    newChatBtn.textContent = t('ai.history.new');
+    renameChatBtn.textContent = t('ai.history.rename');
+    historySearch.placeholder = t('ai.history.searchPlaceholder');
+    composer.placeholder = t('ai.composer.placeholder');
+    setCheckboxLabel(includeTabsLabel, t('ai.option.includeTabs'));
+    setCheckboxLabel(includeTreeLabel, t('ai.option.includeTree'));
+    sendBtn.textContent = sending ? t('ai.stop') : t('ai.send');
+    if (actionRunning?.id) {
+      const action = getAction(actionRunning.id);
+      if (action) actionRunning.label = localizedActionText(action, 'label');
+    }
+    renderHeader();
+    renderMode();
+    renderMessages();
+    refreshActiveContext({ force: true });
+    renderRunnerChip();
+    updateFooter();
+    loadHistory();
+    mcpController.refreshLocale?.();
   }
 
   function renderMode() {
@@ -198,7 +297,7 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
       runnerChip.textContent = '';
       return;
     }
-    const suffix = active ? 'included' : 'click to include';
+    const suffix = active ? t('ai.runner.chipIncluded') : t('ai.runner.chipInclude');
     runnerChip.textContent = `Runner: ${fileName(runnerAttachment.commandLine || 'output')} (${suffix})`;
   }
 
@@ -214,16 +313,18 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     const active = hooks.getActiveTab?.();
     actionsPanel.innerHTML = '';
     const head = el('div', 'ai-actions-head');
-    head.appendChild(el('strong', '', active ? `${fileName(active.filePath || active.name)} actions` : 'Actions'));
-    head.appendChild(el('span', '', active ? `${active.viewType || 'plain'} / ${actionScopes(active).join(', ')}` : 'Open a tab first'));
+    head.appendChild(el('strong', '', active ? fmt('ai.actions.titleWithDoc', { name: fileName(active.filePath || active.name) }) : t('ai.actions.titleDefault')));
+    head.appendChild(el('span', '', active
+      ? fmt('ai.actions.subtitleWithDoc', { type: active.viewType || 'plain', scopes: actionScopes(active).join(', '), provider: providerStatusText() })
+      : t('ai.actions.subtitleNoDoc')));
     actionsPanel.appendChild(head);
 
     if (actionRunning) {
       const run = el('div', 'ai-action-running');
       run.innerHTML = `<span class="ai-spinner"></span><span>${actionRunning.label}</span>`;
-      const cancel = el('button', '', 'Cancel');
+      const cancel = el('button', '', t('dialog.cancel'));
       cancel.type = 'button';
-      cancel.addEventListener('click', () => actionRunning?.controller.abort());
+      cancel.addEventListener('click', cancelRunningAction);
       run.appendChild(cancel);
       actionsPanel.appendChild(run);
     } else if (actionStatus) {
@@ -232,7 +333,7 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
 
     if (!active) {
       const empty = el('div', 'ai-empty');
-      empty.innerHTML = '<strong>No active document.</strong><span>Open a CSV, JSON, Markdown, or Mermaid tab to see format actions.</span>';
+      empty.innerHTML = `<strong>${t('ai.actions.noActiveTitle')}</strong><span>${t('ai.actions.noActiveBody')}</span>`;
       actionsPanel.appendChild(empty);
       return;
     }
@@ -240,21 +341,70 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     const actions = getActionsFor(active.viewType, actionScopes(active));
     if (actions.length === 0) {
       const empty = el('div', 'ai-empty');
-      empty.innerHTML = `<strong>No actions for ${active.viewType || 'plain'} yet.</strong><span>P1-2 currently targets CSV/TSV, JSON, Markdown, and Mermaid.</span>`;
+      empty.innerHTML = `<strong>${fmt('ai.actions.noneTitle', { type: active.viewType || 'plain' })}</strong><span>${t('ai.actions.noneBody')}</span>`;
       actionsPanel.appendChild(empty);
       return;
     }
 
-    const list = el('div', 'ai-action-list');
-    for (const action of actions) {
+    const localActions = actions.filter(action => !actionUsesAI(action));
+    const aiActions = actions.filter(actionUsesAI);
+    const aiBlocked = !providerKeyConfigured();
+
+    function renderActionButton(action, { aiPowered }) {
       const btn = el('button', 'ai-action-card');
       btn.type = 'button';
-      btn.disabled = !!actionRunning;
-      btn.innerHTML = `<span class="ai-action-icon">${action.icon || ''}</span><span><strong>${action.label}</strong><small>${[].concat(action.scope).join(' / ')}</small></span>`;
+      btn.classList.toggle('ai-powered', aiPowered);
+      btn.classList.toggle('local-tool', !aiPowered);
+      btn.disabled = !!actionRunning || (aiPowered && aiBlocked);
+      btn.title = aiPowered && aiBlocked ? fmt('ai.actions.providerKeyMissing', { provider: provider.displayName }) : '';
+      const icon = el('span', 'ai-action-icon');
+      icon.innerHTML = action.icon || '';
+      const text = el('span', 'ai-action-copy');
+      text.appendChild(el('strong', '', localizedActionText(action, 'label')));
+      text.appendChild(el('small', '', localizedActionText(action, 'description') || [].concat(action.scope).join(' / ')));
+      const meta = el('span', 'ai-action-meta');
+      meta.appendChild(el('span', aiPowered ? 'ai-action-badge ai' : 'ai-action-badge local', aiPowered ? t('ai.actions.badgeAi') : t('ai.actions.badgeLocal')));
+      meta.appendChild(el('span', 'ai-action-scope', [].concat(action.scope).join(' / ')));
+      if (aiPowered && aiBlocked) meta.appendChild(el('span', 'ai-action-warning', t('ai.actions.requiresKey')));
+      text.appendChild(meta);
+      btn.append(icon, text);
       btn.addEventListener('click', () => runAIAction(action));
-      list.appendChild(btn);
+      return btn;
     }
-    actionsPanel.appendChild(list);
+
+    function renderActionSection(title, subtitle, items, options = {}) {
+      if (!items.length) return;
+      const section = el('section', 'ai-action-section');
+      const sectionHead = el('div', 'ai-action-section-head');
+      sectionHead.appendChild(el('strong', '', title));
+      sectionHead.appendChild(el('span', '', subtitle));
+      if (options.setupProvider) {
+        const setup = el('button', '', t('ai.actions.setupProvider'));
+        setup.type = 'button';
+        setup.addEventListener('click', openProviderSettings);
+        sectionHead.appendChild(setup);
+      }
+      section.appendChild(sectionHead);
+      const list = el('div', 'ai-action-list');
+      for (const action of items) list.appendChild(renderActionButton(action, { aiPowered: options.aiPowered === true }));
+      section.appendChild(list);
+      actionsPanel.appendChild(section);
+    }
+
+    renderActionSection(
+      t('ai.actions.aiSection'),
+      aiBlocked
+        ? fmt('ai.actions.providerNeeded', { provider: provider.displayName })
+        : fmt('ai.actions.providerUses', { provider: providerStatusText() }),
+      aiActions,
+      { aiPowered: true, setupProvider: aiBlocked },
+    );
+    renderActionSection(
+      t('ai.actions.localSection'),
+      t('ai.actions.localSubtitle'),
+      localActions,
+      { aiPowered: false },
+    );
   }
 
   function renderMessageContent(container, msg) {
@@ -273,14 +423,14 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
       const active = hooks.getActiveTab?.();
       const applicable = extractApplicableCodeBlocks(match[0], active?.viewType).length > 0;
       if (msg.role === 'assistant' && applicable) {
-        const applyBtn = el('button', '', 'Apply');
+        const applyBtn = el('button', '', t('ai.code.apply'));
         applyBtn.type = 'button';
         applyBtn.addEventListener('click', () => {
           const latest = hooks.getActiveTab?.();
           openApplyDiff({
             currentText: latest?.selection || latest?.content || '',
             newText: code,
-            title: `Apply ${lang || latest?.viewType || 'text'} block`,
+            title: fmt('ai.code.applyBlockTitle', { type: lang || latest?.viewType || 'text' }),
             openModal: hooks.openModal,
             closeModal: hooks.closeModal,
             apply: hooks.replaceSelectionOrDocument,
@@ -292,18 +442,18 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
         const runWrap = el('span', 'ai-run-shell');
         const target = document.createElement('select');
         for (const [value, label] of [
-          ['runner', 'Command Runner'],
-          ['terminal', 'Terminal draft'],
-          ['copy', 'Copy'],
+          ['runner', t('ai.code.commandRunner')],
+          ['terminal', t('ai.code.terminalDraft')],
+          ['copy', t('ai.code.copy')],
         ]) {
           const option = document.createElement('option');
           option.value = value;
           option.textContent = label;
           target.appendChild(option);
         }
-        const runBtn = el('button', '', 'Run');
+        const runBtn = el('button', '', t('ai.code.run'));
         runBtn.type = 'button';
-        runBtn.title = 'Prefills only. Commands are never auto-executed from AI responses.';
+        runBtn.title = t('ai.code.prefillSafetyTitle');
         runBtn.addEventListener('click', async () => {
           if (target.value === 'copy') {
             await navigator.clipboard.writeText(code);
@@ -327,20 +477,38 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     if (last < text.length || !text) container.appendChild(el('div', 'ai-message-text', text.slice(last)));
   }
 
+  function loadingLine(label, className = 'ai-loading-line') {
+    const node = el('div', className);
+    node.append(el('span', 'ai-spinner'), el('span', '', label));
+    return node;
+  }
+
   function renderMessages() {
     logEl.innerHTML = '';
     if (messages.length === 0) {
       const empty = el('div', 'ai-empty');
-      empty.innerHTML = '<strong>AI sidebar is ready.</strong><span>Open a tab, add a provider key, and ask for a rewrite, explanation, or format transform.</span>';
+      const active = hooks.getActiveTab?.();
+      empty.appendChild(el('strong', '', active ? fmt('ai.empty.readyWithDoc', { name: fileName(active.filePath || active.name) }) : t('ai.empty.ready')));
+      empty.appendChild(el('span', '', active
+        ? t('ai.empty.readyPromptWithDoc')
+        : t('ai.empty.readyPromptNoDoc')));
       logEl.appendChild(empty);
       return;
     }
     for (const msg of messages) {
       const item = el('article', `ai-message ${msg.role}`);
-      item.appendChild(el('div', 'ai-message-role', msg.role === 'assistant' ? 'FormatPad AI' : 'You'));
+      const bubble = el('div', 'ai-message-bubble');
+      bubble.appendChild(el('div', 'ai-message-role', msg.role === 'assistant' ? t('ai.message.assistant') : t('ai.message.user')));
       const content = el('div', 'ai-message-body');
-      renderMessageContent(content, msg);
-      item.appendChild(content);
+      const waitingForAssistant = msg.role === 'assistant' && !msg.content && sending;
+      if (waitingForAssistant) {
+        bubble.classList.add('loading');
+        content.appendChild(loadingLine(t('ai.message.waiting')));
+      } else {
+        renderMessageContent(content, msg);
+      }
+      bubble.appendChild(content);
+      item.appendChild(bubble);
       logEl.appendChild(item);
     }
     logEl.scrollTop = logEl.scrollHeight;
@@ -355,46 +523,112 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     const contextEstimate = estimateTokens(active?.content || '') + (includeTabs ? 150 : 0) + (includeTree ? 350 : 0) + runnerEstimate;
     const total = promptTokens + contextEstimate;
     const cost = estimateCostUsd(provider, total);
-    footer.textContent = `${promptTokens} prompt tokens / about ${total} with context / $${cost.toFixed(4)} est.${runnerEstimate ? ' runner attached' : ''}`;
+    footer.textContent = fmt('ai.footer.tokenEstimate', {
+      prompt: promptTokens,
+      total,
+      cost: cost.toFixed(4),
+      runner: runnerEstimate ? ` ${t('ai.footer.runnerAttached')}` : '',
+    });
     renderRunnerChip();
   }
 
+  function getActiveContextSummary() {
+    const active = hooks.getActiveTab?.();
+    if (!active) {
+      return {
+        key: 'none',
+        label: t('ai.context.none'),
+      };
+    }
+    const contentLength = String(active.content || '').length;
+    const selectionLength = String(active.selection || '').length;
+    const name = fileName(active.filePath || active.name);
+    const bits = [active.viewType || 'plain', fmt('ai.context.chars', { count: contentLength.toLocaleString() })];
+    if (selectionLength) bits.push(fmt('ai.context.selected', { count: selectionLength.toLocaleString() }));
+    if (active.isModified) bits.push(t('ai.context.unsaved'));
+    return {
+      key: [active.id, active.filePath || active.name || '', active.viewType || '', contentLength, selectionLength, active.isModified ? 'dirty' : 'clean'].join('|'),
+      label: fmt('ai.context.summary', { name, bits: bits.join(', ') }),
+    };
+  }
+
+  let lastActiveContextKey = '';
+  function refreshActiveContext({ force = false } = {}) {
+    const summary = getActiveContextSummary();
+    const changed = force || summary.key !== lastActiveContextKey;
+    if (changed) {
+      lastActiveContextKey = summary.key;
+      activeContextEl.textContent = summary.label;
+      if (messages.length === 0) renderMessages();
+      if (activeMode === 'actions') renderActions();
+    }
+    updateFooter();
+  }
+
   async function loadHistory() {
+    const seq = ++historyLoadSeq;
+    historyList.innerHTML = '';
+    historyList.appendChild(loadingLine(t('ai.history.loading'), 'ai-history-loading'));
     try {
       const items = historyQuery
         ? await conversationStore.search(historyQuery)
         : await conversationStore.list();
+      if (seq !== historyLoadSeq) return;
       historyList.innerHTML = '';
+      if (!items.length) {
+        historyList.appendChild(el('div', 'ai-history-empty', historyQuery ? t('ai.history.noMatching') : t('ai.history.noSaved')));
+        return;
+      }
       for (const item of items) {
-        const btn = el('button', 'ai-history-item');
+        const row = el('div', 'ai-history-item');
+        row.classList.toggle('active', item.id === currentConversation?.id);
+        const btn = el('button', 'ai-history-open');
         btn.type = 'button';
-        btn.classList.toggle('active', item.id === currentConversation?.id);
-        const title = el('span', 'ai-history-title', item.title || 'New chat');
-        const meta = el('span', 'ai-history-meta', `${item.messageCount || 0} messages`);
+        const title = el('span', 'ai-history-title', item.title || t('ai.history.newChat'));
+        const meta = el('span', 'ai-history-meta', fmt('ai.history.messageCount', { count: item.messageCount || 0 }));
         btn.append(title, meta);
         btn.addEventListener('click', async () => {
-          const loaded = await conversationStore.load(item.id);
-          if (!loaded) return;
-          currentConversation = loaded;
-          messages = loaded.messages || [];
-          provider = getProvider(loaded.provider || provider.id);
-          model = loaded.model || getSavedModel(provider);
-          endpoint = getSavedEndpoint(provider);
-          renderHeader();
-          renderMessages();
-          loadHistory();
+          row.classList.add('loading');
+          const spinner = loadingLine(t('ai.history.opening'), 'ai-history-row-loading');
+          row.appendChild(spinner);
+          try {
+            const loaded = await conversationStore.load(item.id);
+            if (!loaded) return;
+            currentConversation = loaded;
+            messages = loaded.messages || [];
+            provider = getProvider(loaded.provider || provider.id);
+            model = loaded.model || getSavedModel(provider);
+            endpoint = getSavedEndpoint(provider);
+            renderHeader();
+            renderMessages();
+            loadHistory();
+          } finally {
+            spinner.remove();
+            row.classList.remove('loading');
+          }
         });
-        historyList.appendChild(btn);
+        const deleteBtn = el('button', 'ai-history-delete', 'x');
+        deleteBtn.type = 'button';
+        deleteBtn.title = t('ai.history.deleteTitle');
+        deleteBtn.setAttribute('aria-label', fmt('ai.history.deleteAria', { title: item.title || t('ai.history.newChat') }));
+        deleteBtn.addEventListener('click', event => deleteHistoryItem(item, event));
+        row.append(btn, deleteBtn);
+        historyList.appendChild(row);
       }
     } catch {
-      historyList.innerHTML = '<div class="ai-history-empty">History unavailable</div>';
+      if (seq !== historyLoadSeq) return;
+      historyList.innerHTML = `<div class="ai-history-empty">${t('ai.history.unavailable')}</div>`;
     }
   }
 
   async function saveConversation() {
+    if (!messages.length) {
+      loadHistory();
+      return;
+    }
     if (!currentConversation) currentConversation = conversationStore.create();
-    const firstUser = messages.find(msg => msg.role === 'user')?.content || 'New chat';
-    currentConversation.title = currentConversation.title === 'New chat'
+    const firstUser = messages.find(msg => msg.role === 'user')?.content || t('ai.history.newChat');
+    currentConversation.title = currentConversation.title === t('ai.history.newChat') || currentConversation.title === 'New chat'
       ? firstUser.slice(0, 70).replace(/\s+/g, ' ')
       : currentConversation.title;
     currentConversation.messages = messages;
@@ -405,25 +639,44 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     loadHistory();
   }
 
+  async function deleteHistoryItem(item, event) {
+    event?.preventDefault();
+    event?.stopPropagation();
+    const title = item.title || t('ai.history.newChat');
+    if (typeof window.confirm === 'function' && !window.confirm(fmt('ai.history.deleteConfirm', { title }))) return;
+    try {
+      if (item.id === currentConversation?.id && sending) cancelChatResponse();
+      await conversationStore.delete(item.id);
+      if (item.id === currentConversation?.id) {
+        messages = [];
+        currentConversation = conversationStore.create();
+        renderMessages();
+      }
+      await loadHistory();
+    } catch (err) {
+      hooks.notify?.('AI history', err);
+    }
+  }
+
   function renameCurrentConversation() {
     const body = el('div', 'ai-settings');
     const input = document.createElement('input');
     input.type = 'text';
-    input.value = currentConversation?.title || 'New chat';
+    input.value = currentConversation?.title || t('ai.history.newChat');
     input.maxLength = 120;
     const row = el('label', 'ai-settings-row');
-    row.append(el('span', '', 'Name'), input);
+    row.append(el('span', '', t('ai.history.nameLabel')), input);
     body.appendChild(row);
     hooks.openModal?.({
-      title: 'Rename conversation',
+      title: t('ai.history.renameTitle'),
       body,
       footer: [
-        { label: 'Cancel', onClick: () => hooks.closeModal?.() },
+        { label: t('dialog.cancel'), onClick: () => hooks.closeModal?.() },
         {
-          label: 'Save',
+          label: t('ai.history.save'),
           primary: true,
           onClick: async () => {
-            currentConversation.title = input.value.trim() || 'New chat';
+            currentConversation.title = input.value.trim() || t('ai.history.newChat');
             await saveConversation();
             hooks.closeModal?.();
           },
@@ -441,6 +694,36 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
 
   function providerUsesStoredKey() {
     return provider.needsKey || keyStatus.providers?.[provider.id]?.hasKey === true;
+  }
+
+  function actionUsesAI(action) {
+    return action.requiresAI !== false;
+  }
+
+  function localizedActionText(action, field) {
+    const key = `ai.action.${action.id}.${field}`;
+    const value = t(key);
+    return value === key ? action[field] : value;
+  }
+
+  function providerKeyConfigured() {
+    return !provider.needsKey || keyStatus.providers?.[provider.id]?.hasKey === true;
+  }
+
+  function providerStatusText() {
+    return `${provider.displayName}${model ? ` / ${model}` : ''}`;
+  }
+
+  function ensureTabActive(tabId, message = 'Original document was closed before applying the AI result.') {
+    if (!tabId) return hooks.getActiveTab?.();
+    let active = hooks.getActiveTab?.();
+    if (active?.id === tabId) return active;
+    const restored = hooks.activateTab?.(tabId);
+    active = hooks.getActiveTab?.();
+    if (restored === false || active?.id !== tabId) {
+      throw makeAbortError(message);
+    }
+    return active;
   }
 
   async function* chatWithCurrentProvider({ requestMessages, tools = [], abortSignal }) {
@@ -477,17 +760,36 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     });
   }
 
-  async function streamAssistantResponse({ requestMessages, assistantMsg, tools = [] }) {
+  async function streamAssistantResponse({ requestMessages, assistantMsg, tools = [], abortSignal, timeoutMs = 120000 }) {
     const toolCalls = [];
-    for await (const chunk of chatWithCurrentProvider({ requestMessages, tools })) {
-      if (chunk.type === 'text') {
-        assistantMsg.content += chunk.delta;
-        renderMessages();
-      } else if (chunk.type === 'tool_call') {
-        toolCalls.push(chunk);
+    const timeoutController = new AbortController();
+    const timeoutId = timeoutMs > 0
+      ? setTimeout(() => abortController(
+        timeoutController,
+        makeAbortError('AI request timed out. Try a smaller document or cancel and retry.', 'TimeoutError'),
+      ), timeoutMs)
+      : null;
+    const linked = linkAbortSignals([abortSignal, timeoutController.signal]);
+    try {
+      throwIfSignalAborted(linked.signal);
+      for await (const chunk of chatWithCurrentProvider({ requestMessages, tools, abortSignal: linked.signal })) {
+        throwIfSignalAborted(linked.signal);
+        if (chunk.type === 'text') {
+          assistantMsg.content += chunk.delta;
+          renderMessages();
+        } else if (chunk.type === 'tool_call') {
+          toolCalls.push(chunk);
+        }
       }
+      throwIfSignalAborted(linked.signal);
+      return toolCalls;
+    } catch (err) {
+      if (linked.signal.aborted) throw linked.signal.reason || err || makeAbortError();
+      throw err;
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+      linked.cleanup();
     }
-    return toolCalls;
   }
 
   function formatToolResultsForModel(results) {
@@ -548,8 +850,23 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     return false;
   }
 
+  function setChatSending(next, controller = null) {
+    sending = next;
+    chatAbortController = next ? controller : null;
+    sendBtn.disabled = false;
+    sendBtn.textContent = next ? t('ai.stop') : t('ai.send');
+  }
+
+  function cancelChatResponse() {
+    if (!chatAbortController) return;
+    abortController(chatAbortController, makeAbortError(t('ai.chat.canceled')));
+  }
+
   async function sendMessage() {
-    if (sending) return;
+    if (sending) {
+      cancelChatResponse();
+      return;
+    }
     const raw = composer.value.trim();
     if (!raw) return;
     if (await handleSlash(raw)) {
@@ -559,10 +876,6 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     }
 
     const active = hooks.getActiveTab?.();
-    if (!active) {
-      hooks.notify?.('AI', new Error('Open a document tab before chatting.'));
-      return;
-    }
 
     const priorHistory = [...messages];
     const userMsg = makeMessage('user', raw);
@@ -573,9 +886,9 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
 
     const assistantMsg = makeMessage('assistant', '');
     messages.push(assistantMsg);
+    const controller = new AbortController();
+    setChatSending(true, controller);
     renderMessages();
-    sending = true;
-    sendBtn.disabled = true;
 
     try {
       const workspaceFiles = includeTree ? await hooks.getWorkspaceFiles?.() : [];
@@ -594,11 +907,14 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
         requestMessages,
         assistantMsg,
         tools: mcpTools,
+        abortSignal: controller.signal,
       });
+      throwIfSignalAborted(controller.signal);
       if (toolCalls.length) {
         const toolResults = await mcpController.resolveToolCalls(toolCalls);
+        throwIfSignalAborted(controller.signal);
         const toolText = formatToolResultsForModel(toolResults);
-        assistantMsg.content += `${assistantMsg.content ? '\n\n' : ''}MCP tool results received. Preparing final answer...\n`;
+        assistantMsg.content += `${assistantMsg.content ? '\n\n' : ''}${t('ai.mcp.toolResultsReceived')}\n`;
         renderMessages();
         await streamAssistantResponse({
           requestMessages: [
@@ -608,45 +924,64 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
           ],
           assistantMsg,
           tools: [],
+          abortSignal: controller.signal,
         });
       }
       track?.('ai_action', {
-        format: active.viewType || 'unknown',
+        format: active?.viewType || 'unknown',
         action_name: 'chat',
         provider: provider.id,
         success: 'true',
       });
     } catch (err) {
-      assistantMsg.content += `${assistantMsg.content ? '\n\n' : ''}Error: ${err.message || String(err)}`;
-      hooks.notify?.('AI', err);
+      assistantMsg.content += `${assistantMsg.content ? '\n\n' : ''}${isCancelError(err) ? t('ai.status.canceled') : fmt('ai.status.error', { message: err.message || String(err) })}`;
+      if (!isAbortError(err)) hooks.notify?.('AI', err);
       track?.('ai_action', {
-        format: active.viewType || 'unknown',
+        format: active?.viewType || 'unknown',
         action_name: 'chat',
         provider: provider.id,
         success: 'false',
       });
-      track?.('error', { type: err.name || 'AIError', format: active.viewType || 'unknown' });
+      track?.('error', { type: err.name || 'AIError', format: active?.viewType || 'unknown' });
     } finally {
-      sending = false;
-      sendBtn.disabled = false;
+      setChatSending(false);
       renderMessages();
-      saveConversation();
+      await saveConversation().catch(err => hooks.notify?.('AI history', err));
     }
   }
 
-  async function completeWithProvider({ prompt, messages: requestMessages, system, abortSignal }) {
+  async function completeWithProvider({ prompt, messages: requestMessages, system, abortSignal, timeoutMs = 120000 }) {
+    throwIfSignalAborted(abortSignal);
     const messagesForProvider = requestMessages || [
       { role: 'system', content: system || 'You are FormatPad AI. Return concise, directly usable output.' },
       { role: 'user', content: prompt },
     ];
+    const timeoutController = new AbortController();
+    const timeoutId = timeoutMs > 0
+      ? setTimeout(() => abortController(
+        timeoutController,
+        makeAbortError('AI request timed out. Try a smaller document or cancel and retry.', 'TimeoutError'),
+      ), timeoutMs)
+      : null;
+    const linked = linkAbortSignals([abortSignal, timeoutController.signal]);
     let text = '';
-    for await (const chunk of chatWithCurrentProvider({
-      requestMessages: messagesForProvider,
-      abortSignal,
-    })) {
-      if (chunk.type === 'text') text += chunk.delta;
+    try {
+      for await (const chunk of chatWithCurrentProvider({
+        requestMessages: messagesForProvider,
+        abortSignal: linked.signal,
+      })) {
+        throwIfSignalAborted(linked.signal);
+        if (chunk.type === 'text') text += chunk.delta;
+      }
+      throwIfSignalAborted(linked.signal);
+      return text;
+    } catch (err) {
+      if (linked.signal.aborted) throw linked.signal.reason || err || makeAbortError();
+      throw err;
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+      linked.cleanup();
     }
-    return text;
   }
 
   function templateSectionPrompt({ active, section, sectionText }) {
@@ -677,14 +1012,22 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     });
     const replacement = (extractCode(response, 'markdown') || response).trim();
     if (!replacement) throw new Error(`AI returned no content for ${section}.`);
-    return openApplyDiff({
-      currentText: current.text || '',
+    ensureTabActive(active.id, 'Template document was closed before applying the AI result.');
+    const latest = hooks.getTemplateSection?.(section);
+    if (!latest) throw new Error(`Section not found: ${section}`);
+    const accepted = await openApplyDiff({
+      currentText: latest.text || '',
       newText: replacement,
       title: `Fill template section: ${section}`,
       openModal: hooks.openModal,
       closeModal: hooks.closeModal,
-      apply: (text) => hooks.replaceTemplateSection?.(section, text),
+      apply: (text) => {
+        ensureTabActive(active.id, 'Template document was closed before applying the AI result.');
+        hooks.replaceTemplateSection?.(section, text);
+      },
     });
+    if (!accepted) throw makeAbortError(`Fill template section: ${section} canceled.`);
+    return accepted;
   }
 
   async function completeTemplateSections(sections) {
@@ -741,29 +1084,55 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
 
   function promptText(title, label, defaultValue = '', options = {}) {
     return new Promise(resolve => {
+      const signal = options.abortSignal;
+      if (signal?.aborted) {
+        resolve('');
+        return;
+      }
+      let settled = false;
       const body = el('div', 'ai-settings');
       const input = options.multiline ? document.createElement('textarea') : document.createElement('input');
       if (!options.multiline) input.type = 'text';
       input.value = defaultValue || '';
       input.placeholder = options.placeholder || '';
       if (options.multiline) input.rows = 8;
+      if (options.description) {
+        const description = el('p', 'ai-prompt-description', String(options.description));
+        body.appendChild(description);
+      }
       const row = el('label', 'ai-settings-row');
       row.append(el('span', '', label), input);
       body.appendChild(row);
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener('abort', onAbort);
+        hooks.closeModal?.();
+        resolve(value);
+      };
+      const onAbort = () => finish('');
+      signal?.addEventListener('abort', onAbort, { once: true });
       hooks.openModal?.({
         title,
         body,
+        onClose: () => finish(''),
         footer: [
-          { label: 'Cancel', onClick: () => { hooks.closeModal?.(); resolve(''); } },
-          { label: 'OK', primary: true, onClick: () => { const value = input.value; hooks.closeModal?.(); resolve(value); } },
+          { label: t('dialog.cancel'), onClick: () => finish('') },
+          { label: t('dialog.ok'), primary: true, onClick: () => finish(input.value) },
         ],
       });
       setTimeout(() => { input.focus(); input.select?.(); }, 0);
     });
   }
 
-  function promptChoice(title, label, options, defaultValue) {
+  function promptChoice(title, label, options, defaultValue, promptOptions = {}) {
     return new Promise(resolve => {
+      const signal = promptOptions.abortSignal;
+      if (signal?.aborted) {
+        resolve('');
+        return;
+      }
+      let settled = false;
       const body = el('div', 'ai-settings');
       const select = document.createElement('select');
       for (const option of options) {
@@ -776,25 +1145,53 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
       const row = el('label', 'ai-settings-row');
       row.append(el('span', '', label), select);
       body.appendChild(row);
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener('abort', onAbort);
+        hooks.closeModal?.();
+        resolve(value);
+      };
+      const onAbort = () => finish('');
+      signal?.addEventListener('abort', onAbort, { once: true });
       hooks.openModal?.({
         title,
         body,
+        onClose: () => finish(''),
         footer: [
-          { label: 'Cancel', onClick: () => { hooks.closeModal?.(); resolve(''); } },
-          { label: 'OK', primary: true, onClick: () => { const value = select.value; hooks.closeModal?.(); resolve(value); } },
+          { label: t('dialog.cancel'), onClick: () => finish('') },
+          { label: t('dialog.ok'), primary: true, onClick: () => finish(select.value) },
         ],
       });
       setTimeout(() => select.focus(), 0);
     });
   }
 
+  function cancelRunningAction() {
+    if (!actionRunning) return;
+    const running = actionRunning;
+    running.canceled = true;
+    abortController(running.controller, makeAbortError(fmt('ai.action.canceled', { label: running.label })));
+    actionStatus = fmt('ai.action.canceled', { label: running.label });
+    actionRunning = null;
+    renderActions();
+  }
+
   async function runAIAction(action, detail = {}) {
     const active = hooks.getActiveTab?.();
     if (!active || actionRunning) return;
     const controller = new AbortController();
-    actionRunning = { id: action.id, label: action.label, controller };
+    const runId = ++actionRunSeq;
+    const actionLabel = localizedActionText(action, 'label');
+    actionRunning = { id: action.id, label: actionLabel, controller, runId, canceled: false };
     actionStatus = '';
     renderActions();
+    const isCurrentRun = () => actionRunning?.runId === runId;
+    const ensureActionActive = () => {
+      if (!isCurrentRun() || controller.signal.aborted) {
+        throw controller.signal.reason || makeAbortError(fmt('ai.action.canceled', { label: actionLabel }));
+      }
+    };
     const context = {
       activeTab: active,
       openTabs: hooks.getOpenTabs?.() || [],
@@ -802,28 +1199,56 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
       detail,
     };
     const ui = {
-      promptText,
-      promptChoice,
+      promptText: (title, label, defaultValue = '', options = {}) => {
+        ensureActionActive();
+        return promptText(title, label, defaultValue, { ...options, abortSignal: controller.signal });
+      },
+      promptChoice: (title, label, options, defaultValue) => {
+        ensureActionActive();
+        return promptChoice(title, label, options, defaultValue, { abortSignal: controller.signal });
+      },
       extractCode,
       extractJson,
-      openTab: ({ name, content, viewType }) => hooks.createTextTab?.(name, content, viewType),
-      applyDocument: ({ title, newText }) => openApplyDiff({
-        currentText: hooks.getActiveTab?.()?.content || '',
-        newText,
-        title,
-        openModal: hooks.openModal,
-        closeModal: hooks.closeModal,
-        apply: hooks.replaceDocument || hooks.replaceSelectionOrDocument,
-      }),
+      openTab: ({ name, content, viewType }) => {
+        ensureActionActive();
+        return hooks.createTextTab?.(name, content, viewType);
+      },
+      applyDocument: ({ title, newText }) => {
+        ensureActionActive();
+        const target = ensureTabActive(active.id);
+        return openApplyDiff({
+          currentText: target?.content || '',
+          newText,
+          title,
+          openModal: hooks.openModal,
+          closeModal: hooks.closeModal,
+          apply: (text) => {
+            ensureActionActive();
+            ensureTabActive(active.id);
+            (hooks.replaceDocument || hooks.replaceSelectionOrDocument)?.(text);
+          },
+        }).then((accepted) => {
+          if (!accepted) throw makeAbortError(fmt('ai.action.canceled', { label: title }));
+          return accepted;
+        });
+      },
       applySelectionOrDocument: ({ title, newText }) => {
-        const latest = hooks.getActiveTab?.();
+        ensureActionActive();
+        const latest = ensureTabActive(active.id);
         return openApplyDiff({
           currentText: latest?.selection || latest?.content || '',
           newText,
           title,
           openModal: hooks.openModal,
           closeModal: hooks.closeModal,
-          apply: hooks.replaceSelectionOrDocument,
+          apply: (text) => {
+            ensureActionActive();
+            ensureTabActive(active.id);
+            hooks.replaceSelectionOrDocument?.(text);
+          },
+        }).then((accepted) => {
+          if (!accepted) throw makeAbortError(fmt('ai.action.canceled', { label: title }));
+          return accepted;
         });
       },
       notify: hooks.notify,
@@ -833,18 +1258,32 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
       const result = await action.run({
         context,
         ui,
-        llm: { complete: (args) => completeWithProvider({ ...args, abortSignal: controller.signal }) },
+        llm: {
+          complete: async (args) => {
+            ensureActionActive();
+            const text = await completeWithProvider({ ...args, abortSignal: controller.signal });
+            ensureActionActive();
+            return text;
+          },
+        },
       });
-      actionStatus = result?.message || `${action.label} finished.`;
+      ensureActionActive();
+      actionStatus = result?.message || fmt('ai.action.finished', { label: actionLabel });
       track?.('ai_action', { format: active.viewType || 'unknown', action_name: action.id, provider: provider.id, success: 'true' });
     } catch (err) {
-      actionStatus = err?.name === 'AbortError' ? `${action.label} canceled.` : `${action.label}: ${err.message || String(err)}`;
-      hooks.notify?.('AI action', err);
-      track?.('ai_action', { format: active.viewType || 'unknown', action_name: action.id, provider: provider.id, success: 'false' });
-      track?.('error', { type: err.name || 'AIActionError', format: active.viewType || 'unknown' });
+      if (isCurrentRun()) {
+        actionStatus = isCancelError(err)
+          ? fmt('ai.action.canceled', { label: actionLabel })
+          : fmt('ai.action.error', { label: actionLabel, message: err.message || String(err) });
+        if (!isAbortError(err)) hooks.notify?.('AI action', err);
+        track?.('ai_action', { format: active.viewType || 'unknown', action_name: action.id, provider: provider.id, success: 'false' });
+        track?.('error', { type: err.name || 'AIActionError', format: active.viewType || 'unknown' });
+      }
     } finally {
-      actionRunning = null;
-      renderActions();
+      if (isCurrentRun()) {
+        actionRunning = null;
+        renderActions();
+      }
     }
   }
 
@@ -863,16 +1302,16 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     const modelInput = document.createElement('input');
     modelInput.type = 'text';
     modelInput.value = model;
-    modelInput.placeholder = 'model id';
+    modelInput.placeholder = t('ai.provider.modelPlaceholder');
 
     const endpointInput = document.createElement('input');
     endpointInput.type = 'text';
     endpointInput.value = endpoint;
-    endpointInput.placeholder = 'endpoint base URL';
+    endpointInput.placeholder = t('ai.provider.endpointPlaceholder');
 
     const keyInput = document.createElement('input');
     keyInput.type = 'password';
-    keyInput.placeholder = 'Paste API key to save or replace';
+    keyInput.placeholder = t('ai.provider.keyPlaceholder');
 
     const status = el('div', 'ai-key-status');
 
@@ -884,16 +1323,16 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
       keyInput.disabled = !selected.needsKey && selected.id !== 'openai-compatible';
       const entry = keyStatus.providers?.[selected.id];
       status.textContent = selected.needsKey || selected.id === 'openai-compatible'
-        ? (entry?.hasKey ? `Saved key: ${entry.mask}` : 'No key saved.')
-        : 'No API key required.';
+        ? (entry?.hasKey ? fmt('ai.provider.savedKey', { mask: entry.mask }) : t('ai.provider.noKeySaved'))
+        : t('ai.provider.noKeyRequired');
     }
 
     providerSelect.addEventListener('change', refreshFields);
     for (const [label, control] of [
-      ['Provider', providerSelect],
-      ['Model', modelInput],
-      ['Endpoint', endpointInput],
-      ['API key', keyInput],
+      [t('ai.provider.provider'), providerSelect],
+      [t('ai.provider.model'), modelInput],
+      [t('ai.provider.endpoint'), endpointInput],
+      [t('ai.provider.apiKey'), keyInput],
     ]) {
       const row = el('label', 'ai-settings-row');
       row.append(el('span', '', label), control);
@@ -903,21 +1342,22 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
     refreshFields();
 
     hooks.openModal?.({
-      title: 'AI provider settings',
+      title: t('ai.provider.settingsTitle'),
       body,
       footer: [
-        { label: 'Cancel', onClick: () => hooks.closeModal?.() },
+        { label: t('dialog.cancel'), onClick: () => hooks.closeModal?.() },
         {
-          label: 'Remove key',
+          label: t('ai.provider.removeKey'),
           onClick: async () => {
             const selected = providerSelect.value;
             await keyStore.remove(selected);
             keyStatus = await keyStore.status();
             refreshFields();
+            renderActions();
           },
         },
         {
-          label: 'Save',
+          label: t('ai.history.save'),
           primary: true,
           onClick: async () => {
             provider = getProvider(providerSelect.value);
@@ -935,6 +1375,7 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
             }
             keyStatus = await keyStore.status();
             renderHeader();
+            renderActions();
             updateFooter();
             hooks.closeModal?.();
           },
@@ -946,38 +1387,47 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
   function toggle(force) {
     const visible = force === undefined ? root.classList.contains('hidden') : force;
     setSidebarVisible(root, resize, visible);
+    hooks.onVisibilityChange?.(visible);
     if (visible) {
+      refreshActiveContext({ force: true });
       composer.focus();
       updateFooter();
     }
   }
 
+  function openMode(mode) {
+    activeMode = mode;
+    toggle(true);
+    renderMode();
+    refreshActiveContext({ force: true });
+    if (mode === 'chat') composer.focus();
+  }
+
   function startNewChat() {
     messages = [];
     currentConversation = conversationStore.create();
-    activeMode = 'chat';
-    toggle(true);
-    renderMode();
+    openMode('chat');
     renderMessages();
     loadHistory();
-    composer.focus();
   }
 
   function openActionsMode() {
-    activeMode = 'actions';
-    toggle(true);
-    renderMode();
+    openMode('actions');
+  }
+
+  function openMcpMode() {
+    openMode('mcp');
   }
 
   function runLastActionCommand() {
     const active = hooks.getActiveTab?.();
     if (!active) {
-      hooks.notify?.('AI', new Error('Open a document before running an AI action.'));
+      hooks.notify?.(t('ai.message.assistant'), new Error(t('ai.actions.openDocumentFirst')));
       return;
     }
     const action = getActionsFor(active.viewType, actionScopes(active))[0];
     if (!action) {
-      hooks.notify?.('AI', new Error(`No AI actions are available for ${active.viewType || 'this document'}.`));
+      hooks.notify?.(t('ai.message.assistant'), new Error(fmt('ai.actions.noneTitle', { type: active.viewType || t('ai.actions.thisDocument') })));
       return;
     }
     openActionsMode();
@@ -985,7 +1435,6 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
   }
 
   providerBtn.addEventListener('click', openProviderSettings);
-  closeBtn.addEventListener('click', () => toggle(false));
   sendBtn.addEventListener('click', sendMessage);
   composer.addEventListener('input', () => {
     clearTimeout(composer._aiTimer);
@@ -1098,19 +1547,35 @@ export function createAISidebar({ workspaceEl, hooks, keyStore, conversationStor
   renderHeader();
   renderMode();
   renderMessages();
-  updateFooter();
-  keyStore.status().then(status => { keyStatus = status || keyStatus; }).catch(() => {});
+  refreshActiveContext({ force: true });
+  keyStore.status().then(status => {
+    keyStatus = status || keyStatus;
+    renderHeader();
+    renderActions();
+  }).catch(() => {});
   loadHistory();
-  setSidebarVisible(root, resize, localStorage.getItem(LS.visible) === 'true');
+  const initialVisible = localStorage.getItem(LS.visible) === 'true';
+  setSidebarVisible(root, resize, initialVisible);
+  hooks.onVisibilityChange?.(initialVisible);
+  if (initialVisible) refreshActiveContext({ force: true });
 
   return {
     toggle,
+    isVisible() {
+      return !root.classList.contains('hidden');
+    },
+    refreshActiveContext,
+    openChat() {
+      openMode('chat');
+    },
     newChat: startNewChat,
     openActions: openActionsMode,
+    openMcp: openMcpMode,
     openSettings() {
       toggle(true);
       openProviderSettings();
     },
     runLastAction: runLastActionCommand,
+    refreshLocale,
   };
 }

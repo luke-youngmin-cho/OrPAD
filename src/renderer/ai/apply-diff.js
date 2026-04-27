@@ -1,3 +1,5 @@
+import { t } from '../i18n.js';
+
 const LANG_ALIASES = {
   markdown: ['markdown', 'md', 'mdx'],
   mermaid: ['mermaid', 'mmd'],
@@ -67,9 +69,9 @@ function lineEl(row, side) {
   return div;
 }
 
-export function openApplyDiff({ currentText, newText, title = 'Apply AI result', openModal, closeModal, apply }) {
+export function openApplyDiff({ currentText, newText, title = t('ai.diff.title'), openModal, closeModal, apply }) {
   if (!openModal) {
-    if (window.confirm('Replace the current selection or document with the AI result?')) {
+    if (window.confirm(t('ai.diff.confirmReplace'))) {
       apply(newText);
       return Promise.resolve(true);
     }
@@ -77,18 +79,26 @@ export function openApplyDiff({ currentText, newText, title = 'Apply AI result',
   }
 
   return new Promise(resolve => {
+    let settled = false;
+    const finish = (accepted) => {
+      if (settled) return;
+      settled = true;
+      if (accepted) apply(newText);
+      closeModal?.();
+      resolve(accepted);
+    };
     const body = document.createElement('div');
     body.className = 'ai-diff-modal';
     const intro = document.createElement('p');
-    intro.textContent = 'Review the proposed replacement. Accepting creates a normal undoable editor change.';
+    intro.textContent = t('ai.diff.intro');
     const grid = document.createElement('div');
     grid.className = 'ai-diff-grid';
     const left = document.createElement('div');
     left.className = 'ai-diff-pane';
     const right = document.createElement('div');
     right.className = 'ai-diff-pane';
-    left.innerHTML = '<div class="ai-diff-title">Current</div>';
-    right.innerHTML = '<div class="ai-diff-title">AI result</div>';
+    left.innerHTML = `<div class="ai-diff-title">${t('ai.diff.current')}</div>`;
+    right.innerHTML = `<div class="ai-diff-title">${t('ai.diff.result')}</div>`;
     for (const row of diffLines(currentText, newText)) {
       left.appendChild(lineEl(row, 'left'));
       right.appendChild(lineEl(row, 'right'));
@@ -99,16 +109,13 @@ export function openApplyDiff({ currentText, newText, title = 'Apply AI result',
     openModal({
       title,
       body,
+      onClose: () => finish(false),
       footer: [
-        { label: 'Cancel', onClick: () => { closeModal?.(); resolve(false); } },
+        { label: t('dialog.cancel'), onClick: () => finish(false) },
         {
-          label: 'Accept',
+          label: t('ai.diff.accept'),
           primary: true,
-          onClick: () => {
-            apply(newText);
-            closeModal?.();
-            resolve(true);
-          },
+          onClick: () => finish(true),
         },
       ],
     });

@@ -1,5 +1,5 @@
 try { require("v8-compile-cache"); } catch {}
-const { app, BrowserWindow, ipcMain, nativeTheme, dialog, shell, session, safeStorage, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, nativeTheme, dialog, shell, session, safeStorage, Menu, screen } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs').promises;
@@ -8,9 +8,11 @@ const { registerAiKeyHandlers } = require('./ai-keys');
 const { registerAiConversationHandlers } = require('./ai-conversations');
 const { registerMcpHandlers } = require('./mcp/ipc');
 const { registerTerminalHandlers } = require('./terminal/ipc');
-const { createAuthorityManager } = require('./authority');
+const { createAuthorityManager, isInsidePath } = require('./authority');
 
 const windows = new Set();
+const terminalWindows = new Set();
+const terminalWindowContexts = new Map();
 const watchers = new Map();
 const snippetWatchers = new Map();
 const authority = createAuthorityManager();
@@ -134,6 +136,13 @@ function initLocale() {
 
 function t(key) { return appStrings[key] || localeData.en[key] || key; }
 
+function broadcastLocaleChanged() {
+  const payload = { code: appLocale };
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send('locale-changed', payload);
+  }
+}
+
 // --- Single instance lock ---
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) app.quit();
@@ -224,6 +233,7 @@ function createWindow(filePath) {
       if (entry.flushTimer) clearTimeout(entry.flushTimer);
       watchers.delete(windowId);
     }
+    if (windows.size === 0) closeTerminalWindows();
   });
 
   webContents.setWindowOpenHandler(({ url }) => {
@@ -246,6 +256,119 @@ function createWindow(filePath) {
   });
 
   windows.add(win);
+  return win;
+}
+
+function clampNumber(value, min, max, fallback) {
+  const next = Number(value);
+  if (!Number.isFinite(next)) return fallback;
+  return Math.max(min, Math.min(max, next));
+}
+
+function terminalWindowBounds(requested = {}, openerWindow = null) {
+  const width = clampNumber(requested.width, 560, 1800, 920);
+  const height = clampNumber(requested.height, 360, 1200, 620);
+  const openerBounds = openerWindow?.getBounds?.() || null;
+  const fallbackPoint = openerBounds
+    ? { x: openerBounds.x + Math.round(openerBounds.width / 2), y: openerBounds.y + Math.round(openerBounds.height / 2) }
+    : screen.getCursorScreenPoint();
+  const rawX = Number(requested.x);
+  const rawY = Number(requested.y);
+  const point = {
+    x: Number.isFinite(rawX) ? rawX : fallbackPoint.x - Math.round(width / 2),
+    y: Number.isFinite(rawY) ? rawY : fallbackPoint.y - Math.round(height / 2),
+  };
+  const display = screen.getDisplayNearestPoint({
+    x: point.x + Math.round(width / 2),
+    y: point.y + Math.round(height / 2),
+  });
+  const area = display.workArea;
+  return {
+    width,
+    height,
+    x: Math.round(clampNumber(point.x, area.x, area.x + area.width - width, area.x)),
+    y: Math.round(clampNumber(point.y, area.y, area.y + area.height - height, area.y)),
+  };
+}
+
+function activeTerminalWindow() {
+  for (const win of terminalWindows) {
+    if (win && !win.isDestroyed()) return win;
+  }
+  return null;
+}
+
+function focusTerminalWindow(win = activeTerminalWindow()) {
+  if (!win || win.isDestroyed()) return false;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  return true;
+}
+
+function closeTerminalWindows() {
+  for (const win of Array.from(terminalWindows)) {
+    if (!win || win.isDestroyed()) continue;
+    win.close();
+  }
+}
+
+function mainWindowForTerminalContext(context = {}) {
+  const openerId = Number(context.openerWebContentsId || 0);
+  for (const win of windows) {
+    if (!win.isDestroyed() && win.webContents.id === openerId) return win;
+  }
+  for (const win of windows) {
+    if (!win.isDestroyed()) return win;
+  }
+  return null;
+}
+
+function createTerminalWindow({ openerWebContents, workspaceRoot = '', cwd = '', bounds = null } = {}) {
+  const openerWindow = openerWebContents ? BrowserWindow.fromWebContents(openerWebContents) : null;
+  const safeBounds = terminalWindowBounds(bounds || {}, openerWindow);
+  const win = new BrowserWindow({
+    ...safeBounds,
+    minWidth: 560,
+    minHeight: 360,
+    icon: path.join(__dirname, '../../assets/icon.ico'),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+    show: false,
+    backgroundColor: '#1a1b26',
+    title: 'FormatPad Terminal',
+  });
+  const webContentsId = win.webContents.id;
+  const context = {
+    openerWebContentsId: openerWebContents?.id || 0,
+    workspaceRoot: workspaceRoot ? path.resolve(String(workspaceRoot)) : '',
+    cwd: cwd ? path.resolve(String(cwd)) : '',
+  };
+
+  win.setMenuBarVisibility(false);
+  if (context.workspaceRoot) authority.grantWorkspace(win.webContents, context.workspaceRoot);
+  terminalWindowContexts.set(webContentsId, context);
+  terminalWindows.add(win);
+  win.loadFile(path.join(__dirname, '../renderer/terminal-window.html'));
+  win.webContents.setVisualZoomLevelLimits(1, 1);
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+  win.once('ready-to-show', () => {
+    if (!win.isDestroyed()) win.show();
+  });
+  win.on('closed', () => {
+    terminalWindows.delete(win);
+    terminalWindowContexts.delete(webContentsId);
+    authority.forget({ id: webContentsId });
+  });
   return win;
 }
 
@@ -342,6 +465,57 @@ registerAiConversationHandlers({ ipcMain, authority });
 registerMcpHandlers({ ipcMain, app, authority });
 registerTerminalHandlers({ ipcMain, app, authority });
 
+ipcMain.handle('terminal-window-open', async (event, request = {}) => {
+  const existing = activeTerminalWindow();
+  if (existing) {
+    focusTerminalWindow(existing);
+    return { id: existing.id, success: true, reused: true };
+  }
+  const openerWorkspace = authority.getWorkspaceRoot(event.sender) || await readApprovedWorkspace();
+  const workspaceRoot = openerWorkspace ? path.resolve(String(openerWorkspace)) : '';
+  let cwd = '';
+  if (request?.cwd) {
+    const candidate = path.resolve(String(request.cwd));
+    if (!workspaceRoot || isInsidePath(candidate, workspaceRoot)) {
+      cwd = candidate;
+    }
+  }
+  const win = createTerminalWindow({
+    openerWebContents: event.sender,
+    workspaceRoot,
+    cwd: cwd || workspaceRoot,
+    bounds: request?.bounds || null,
+  });
+  return { id: win.id, success: true };
+});
+
+ipcMain.handle('terminal-window-status', async () => {
+  const win = activeTerminalWindow();
+  return win ? { open: true, id: win.id } : { open: false };
+});
+
+ipcMain.handle('terminal-window-focus', async () => {
+  return focusTerminalWindow();
+});
+
+ipcMain.handle('terminal-window-dock-main', async (event) => {
+  const sourceWindow = BrowserWindow.fromWebContents(event.sender);
+  const context = terminalWindowContexts.get(event.sender.id) || {};
+  const targetWindow = mainWindowForTerminalContext(context);
+  if (targetWindow && !targetWindow.isDestroyed()) {
+    if (targetWindow.isMinimized()) targetWindow.restore();
+    targetWindow.show();
+    targetWindow.focus();
+    targetWindow.webContents.send('terminal-window-docked', { layout: 'bottom' });
+  }
+  if (sourceWindow && !sourceWindow.isDestroyed()) sourceWindow.close();
+  return { success: true };
+});
+
+ipcMain.handle('terminal-window-context', async (event) => {
+  return terminalWindowContexts.get(event.sender.id) || { workspaceRoot: '', cwd: '' };
+});
+
 ipcMain.handle('get-system-theme', () => {
   return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
 });
@@ -356,7 +530,11 @@ ipcMain.handle('get-locale', async () => {
 });
 
 ipcMain.on('set-locale', (_event, code) => {
-  if (localeData[code]) { appLocale = code; appStrings = localeData[code]; }
+  if (localeData[code]) {
+    appLocale = code;
+    appStrings = localeData[code];
+    broadcastLocaleChanged();
+  }
 });
 
 ipcMain.on('set-title', (event, title) => {
