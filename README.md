@@ -2,9 +2,11 @@
 
 <p align="center">
   <img src="assets/icon.png" alt="OrPAD" width="256" height="256">
+  <br>
+  <img src="assets/orpad-label.png" alt="Orchestration Pipeline Authoring & Development" width="640">
 </p>
 
-**OrPAD (Orchestration Pipeline Authoring & Development) is a local-first
+**OrPAD (<a>Or</a>chestration <a>P</a>ipeline <a>A</a>uthoring & <a>D</a>evelopment) is a local-first
 editor for Markdown, structured data, diagrams, and AI-assisted writing
 workflows.**
 
