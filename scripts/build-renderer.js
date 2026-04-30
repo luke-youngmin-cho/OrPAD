@@ -5,10 +5,8 @@ const fs = require('fs');
 const distDir = path.join(__dirname, '../dist');
 if (!fs.existsSync(distDir)) fs.mkdirSync(distDir, { recursive: true });
 
-esbuild.buildSync({
-  entryPoints: [path.join(__dirname, '../src/renderer/renderer.js')],
+const common = {
   bundle: true,
-  outfile: path.join(distDir, 'renderer.js'),
   platform: 'browser',
   format: 'iife',
   minify: process.argv.includes('--minify'),
@@ -17,7 +15,36 @@ esbuild.buildSync({
   loader: { '.css': 'text' },
   define: {
     'process.env.NODE_ENV': '"production"',
+    'process.env.FORMATPAD_WEB': '"false"',
+    'process.env.PLAUSIBLE_DOMAIN': JSON.stringify(process.env.PLAUSIBLE_DOMAIN || ''),
+    'process.env.APP_VERSION': JSON.stringify(require('../package.json').version),
   },
-});
+};
 
-console.log('FormatPad renderer bundled successfully.');
+const browserSafeAliases = {
+  name: 'browser-safe-aliases',
+  setup(build) {
+    build.onResolve({ filter: /^isomorphic-git$/ }, () => ({
+      path: path.join(__dirname, '../node_modules/isomorphic-git/index.js'),
+    }));
+  },
+};
+
+Promise.all([
+  esbuild.build({
+    ...common,
+    entryPoints: [path.join(__dirname, '../src/renderer/renderer.js')],
+    outfile: path.join(distDir, 'renderer.js'),
+    plugins: [browserSafeAliases],
+  }),
+  esbuild.build({
+    ...common,
+    entryPoints: [path.join(__dirname, '../src/renderer/terminal-window.js')],
+    outfile: path.join(distDir, 'terminal-window.js'),
+  }),
+]).then(() => {
+  console.log('FormatPad renderer bundled successfully.');
+}).catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

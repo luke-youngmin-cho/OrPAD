@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["store", "version"],
+  "properties": {
+    "store": {
+      "type": "object",
+      "required": ["book", "name"],
+      "properties": {
+        "book": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "title", "author"],
+            "properties": {
+              "id": { "type": "integer" },
+              "title": { "type": "string" },
+              "author": { "type": "string" }
+            }
+          }
+        },
+        "name": { "type": "string" }
+      }
+    },
+    "version": { "type": "integer" }
+  }
+}

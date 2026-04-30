@@ -1,0 +1,11 @@
+{
+  "name": "FormatPad Test",
+  "version": "1.0.0",
+  "settings": {
+    "theme": "dark",
+    "fontSize": 14,
+    "autoSave": true
+  },
+  "tags": ["editor", "json", "test"],
+  "count": 42
+}

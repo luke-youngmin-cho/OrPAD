@@ -28,6 +28,7 @@ import uk from '../locales/uk.json';
 import id from '../locales/id.json';
 import ms from '../locales/ms.json';
 import he from '../locales/he.json';
+import { extraLocales } from './i18n-extra.js';
 
 const locales = {
   en, ko, zh, 'zh-TW': zhTW, ja, es, fr, de, pt, ru,
@@ -76,10 +77,13 @@ export function setLocale(code) {
   current = locales[currentCode];
   document.documentElement.lang = currentCode;
   document.body.dataset.dropText = current.dropHere;
+  window.dispatchEvent(new CustomEvent('formatpad-locale-changed', {
+    detail: { code: currentCode },
+  }));
 }
 
 export function t(key) {
-  return current[key] || en[key] || key;
+  return current[key] || extraLocales[currentCode]?.[key] || en[key] || key;
 }
 
 export function getLocaleCode() {

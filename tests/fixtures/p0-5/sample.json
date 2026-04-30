@@ -1,0 +1,11 @@
+{
+  "store": {
+    "book": [
+      { "id": 1, "title": "JSON Path Guide", "author": "Alice" },
+      { "id": 2, "title": "XPath Primer", "author": "Bob" },
+      { "id": 3, "title": "Schema Design", "author": "Carol" }
+    ],
+    "name": "Tech Books"
+  },
+  "version": 1
+}
